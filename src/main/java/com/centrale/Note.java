@@ -5,6 +5,8 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.GridLayout;
 import java.awt.Insets;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
@@ -21,7 +23,9 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.swing.JButton;
@@ -52,6 +56,7 @@ public class Note {
     static int[] columnNote = {2};
     static JTable tableNote;
     static JTable tableMoyenne;
+    static JLabel labelGenerale;
     static String[] nomsMatieres = new String[0];
 
     // =====================================================================
@@ -60,10 +65,12 @@ public class Note {
     // Fichier notes_backup.csv, une ligne par matière ou par note :
     //     type;matiere;valeur;quotient;coefficient;statut
     //   type   : M (matière) ou N (note)
-    //   coefficient : poids de la note dans la moyenne de la matière (1 par défaut)
+    //   coefficient : ligne M = poids de la matière dans la moyenne générale
+    //                 ligne N = poids de la note dans la moyenne de la matière (1 par défaut)
     //   statut : SYNC = présent dans la BDD ET dans le fichier
     //            ADD  = ajouté hors-ligne, pas encore envoyé à la BDD
     //            DEL  = supprimé hors-ligne, pas encore supprimé de la BDD
+    //            MOD  = coefficient de matière changé hors-ligne, pas encore envoyé à la BDD
     //
     // Règles :
     //  - chaque ajout/suppression met à jour la BDD ET le CSV en même temps ;
@@ -78,6 +85,7 @@ public class Note {
         static final String SYNC = "SYNC";
         static final String ADD = "ADD";
         static final String DEL = "DEL";
+        static final String MOD = "MOD";
 
         static final class Entry {
             final String type;
@@ -154,9 +162,36 @@ public class Note {
 
         // ---------- Mises à jour appelées en même temps que la BDD ----------
 
-        static synchronized void ajouterMatiere(String nom, boolean dbOk) {
+        static synchronized void ajouterMatiere(String nom, double coefficient, boolean dbOk) {
             List<Entry> l = lire();
-            l.add(new Entry("M", nom, 0, 0, 1.0, dbOk ? SYNC : ADD));
+            l.add(new Entry("M", nom, 0, 0, coefficient, dbOk ? SYNC : ADD));
+            ecrire(l);
+        }
+
+        /**
+         * Renomme une matière (ses notes suivent) et change son coefficient.
+         * Hors-ligne, un coefficient déjà synchronisé passe en MOD (envoyé à la BDD plus tard).
+         */
+        static synchronized void modifierMatiere(String ancienNom, String nouveauNom, double coefficient, boolean dbOk) {
+            List<Entry> l = lire();
+            for (int i = 0; i < l.size(); i++) {
+                Entry e = l.get(i);
+                if (!e.matiere.equals(ancienNom)) continue;
+                if (e.type.equals("M")) {
+                    boolean coefChange = Math.abs(e.coefficient - coefficient) >= 0.001;
+                    String statut = (!dbOk && coefChange && e.statut.equals(SYNC)) ? MOD : e.statut;
+                    l.set(i, new Entry("M", nouveauNom, 0, 0, coefficient, statut));
+                } else {
+                    l.set(i, new Entry(e.type, nouveauNom, e.valeur, e.quotient, e.coefficient, e.statut));
+                }
+            }
+            ecrire(l);
+        }
+
+        /** Retire la matière et toutes ses notes du fichier. */
+        static synchronized void supprimerMatiere(String nom) {
+            List<Entry> l = lire();
+            l.removeIf(e -> e.matiere.equals(nom));
             ecrire(l);
         }
 
@@ -204,6 +239,15 @@ public class Note {
             return noms;
         }
 
+        /** Coefficient de chaque matière, dans l'ordre d'ajout (1 si inconnu). */
+        static synchronized Map<String, Double> coefficientsMatieres() {
+            Map<String, Double> coefs = new LinkedHashMap<>();
+            for (Entry e : lire()) {
+                if (e.type.equals("M")) coefs.put(e.matiere, e.coefficient > 0 ? e.coefficient : 1.0);
+            }
+            return coefs;
+        }
+
         static synchronized List<String> listerNotes(String matiere) {
             List<String> notes = new ArrayList<>();
             for (Entry e : lire()) {
@@ -227,13 +271,16 @@ public class Note {
             if (enAttente) {
                 boolean toutOk = true;
 
-                // 1) les matières créées hors-ligne d'abord
+                // 1) les matières créées ou modifiées hors-ligne d'abord
                 for (Entry e : l) {
-                    if (e.type.equals("M") && e.statut.equals(ADD)) {
-                        boolean ok = MatiereDAO.trouverIdParNom(e.matiere) != null
-                                || MatiereDAO.inserer(e.matiere, 1.0) != -1;
-                        if (ok) e.statut = SYNC; else toutOk = false;
+                    if (!e.type.equals("M") || e.statut.equals(SYNC)) continue;
+                    boolean ok;
+                    if (MatiereDAO.trouverIdParNom(e.matiere) == null) {
+                        ok = MatiereDAO.inserer(e.matiere, e.coefficient) != -1;
+                    } else {
+                        ok = MatiereDAO.modifier(e.matiere, e.matiere, e.coefficient);
                     }
+                    if (ok) e.statut = SYNC; else toutOk = false;
                 }
 
                 // 2) puis les notes ajoutées / supprimées hors-ligne
@@ -265,7 +312,7 @@ public class Note {
 
         /** Réécrit le CSV à partir de la BDD. Si la lecture BDD échoue, le CSV existant n'est pas touché. */
         static synchronized void reconstruireDepuisBD() {
-            String sql = "SELECT m.nom, n.valeur, n.quotient, n.coefficient FROM matieres m "
+            String sql = "SELECT m.nom, m.coefficient AS coef_matiere, n.valeur, n.quotient, n.coefficient FROM matieres m "
                        + "LEFT JOIN notes n ON n.matiere_id = m.id ORDER BY m.id, n.id";
             List<Entry> l = new ArrayList<>();
             String derniere = null;
@@ -275,7 +322,7 @@ public class Note {
                 while (rs.next()) {
                     String nom = rs.getString("nom");
                     if (!nom.equals(derniere)) {
-                        l.add(new Entry("M", nom, 0, 0, 1.0, SYNC));
+                        l.add(new Entry("M", nom, 0, 0, rs.getDouble("coef_matiere"), SYNC));
                         derniere = nom;
                     }
                     int valeur = rs.getInt("valeur");
@@ -356,6 +403,7 @@ public class Note {
                 stmt.execute(sqlNotes);
                 // Base déjà existante sans la colonne : on l'ajoute (les anciennes notes valent coefficient 1)
                 stmt.execute("ALTER TABLE notes ADD COLUMN IF NOT EXISTS coefficient NUMERIC(4,2) NOT NULL DEFAULT 1");
+                stmt.execute("ALTER TABLE matieres ADD COLUMN IF NOT EXISTS coefficient NUMERIC(4,2) NOT NULL DEFAULT 1");
                 System.out.println("Tables 'matieres' et 'notes' prêtes.");
                 schemaPret = true;
             } catch (SQLException e) {
@@ -388,7 +436,7 @@ public class Note {
             try (Connection conn = Database.getConnection();
                  PreparedStatement stmt = conn.prepareStatement(sql)) {
                 stmt.setString(1, nom);
-                stmt.setDouble(2, coefficient);
+                stmt.setBigDecimal(2, toDecimal(coefficient));
                 try (ResultSet rs = stmt.executeQuery()) {
                     if (rs.next()) return rs.getInt("id");
                 }
@@ -396,6 +444,34 @@ public class Note {
                 e.printStackTrace();
             }
             return -1;
+        }
+
+        /** Renomme une matière et change son coefficient. false si la BDD a refusé (nom déjà pris, injoignable...). */
+        static boolean modifier(String ancienNom, String nouveauNom, double coefficient) {
+            String sql = "UPDATE matieres SET nom = ?, coefficient = ? WHERE nom = ?";
+            try (Connection conn = Database.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, nouveauNom);
+                stmt.setBigDecimal(2, toDecimal(coefficient));
+                stmt.setString(3, ancienNom);
+                return stmt.executeUpdate() > 0;
+            } catch (SQLException e) {
+                e.printStackTrace();
+                return false;
+            }
+        }
+
+        /** Supprime la matière et ses notes (ON DELETE CASCADE). */
+        static boolean supprimer(String nom) {
+            try (Connection conn = Database.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement("DELETE FROM matieres WHERE nom = ?")) {
+                stmt.setString(1, nom);
+                stmt.executeUpdate();
+                return true;
+            } catch (SQLException e) {
+                e.printStackTrace();
+                return false;
+            }
         }
 
         static List<String> listerNoms() {
@@ -560,22 +636,48 @@ public class Note {
         };
         tableNote.setModel(modelNote);
 
+        tableMoyenne.setModel(modeleMoyennes());
+    }
+
+    /**
+     * Tableau des moyennes (matière, coefficient, moyenne) et mise à jour de la moyenne générale :
+     * somme(moyenne x coef de la matière) / somme(coefs), sur les matières qui ont au moins une note.
+     */
+    static DefaultTableModel modeleMoyennes() {
         ListMatiere();
         List<Double> moyennes = calculMoyenneGenerale();
+        Map<String, Double> coefs = CsvMirror.coefficientsMatieres();
 
-        DefaultTableModel modelMoyenne = new DefaultTableModel(new String[]{"Matière", "Moyenne"}, 0) {
+        DefaultTableModel modelMoyenne = new DefaultTableModel(new String[]{"Matière", "Coefficient", "Moyenne"}, 0) {
             @Override
             public boolean isCellEditable(int row, int column) {
                 return false;
             }
         };
 
+        double sommePonderee = 0, sommeCoefs = 0;
         for (int i = 0; i < nomsMatieres.length; i++) {
             Double m = (i < moyennes.size()) ? moyennes.get(i) : null;
+            double coef = coefs.getOrDefault(nomsMatieres[i], 1.0);
+            if (m != null) {
+                sommePonderee += m * coef;
+                sommeCoefs += coef;
+            }
             String affichage = (m == null) ? "" : String.format("%.2f", m);
-            modelMoyenne.addRow(new Object[]{ nomsMatieres[i], affichage });
+            modelMoyenne.addRow(new Object[]{ nomsMatieres[i], formatCoef(coef), affichage });
         }
-        tableMoyenne.setModel(modelMoyenne);
+
+        if (labelGenerale != null) {
+            if (sommeCoefs > 0) {
+                double g = sommePonderee / sommeCoefs;
+                labelGenerale.setText(String.format("Moyenne générale : %.2f / 20", g));
+                labelGenerale.setForeground(g >= 10 ? Theme.SUCCES : g >= 8 ? Theme.ATTENTION : Theme.RETARD);
+            } else {
+                labelGenerale.setText("Moyenne générale : —");
+                labelGenerale.setForeground(Theme.TEXT_DISCRET);
+            }
+        }
+        return modelMoyenne;
     }
 
     // =====================================================================
@@ -650,6 +752,12 @@ public class Note {
         JLabel labelMatiere = new JLabel("Nom de la matière :");
         styleLabel(labelMatiere);
 
+        JTextField coefField = new JTextField("1", 10);
+        styleTextField(coefField);
+        ((PlainDocument) coefField.getDocument()).setDocumentFilter(new CoefFilter());
+        JLabel labelCoef = new JLabel("Coefficient :");
+        styleLabel(labelCoef);
+
         JPanel centerPanel = new JPanel(new GridBagLayout());
         centerPanel.setBackground(Theme.BACKGROUND);
         GridBagConstraints gbc = new GridBagConstraints();
@@ -661,32 +769,35 @@ public class Note {
         gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
         centerPanel.add(matiereField, gbc);
 
+        gbc.gridx = 0; gbc.gridy = 1; gbc.fill = GridBagConstraints.NONE;
+        centerPanel.add(labelCoef, gbc);
+        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
+        centerPanel.add(coefField, gbc);
+
         JButton validButton = themedButton("Valider");
         validButton.addActionListener(e -> {
             String saisie = matiereField.getText().trim();
-            if (saisie.isEmpty()) {
-                JOptionPane.showMessageDialog(addMatiereFrame, "Le nom ne peut pas être vide.", "Erreur", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-            if (saisie.contains(";")) {
-                JOptionPane.showMessageDialog(addMatiereFrame, "Le caractère ';' est interdit dans le nom (séparateur du CSV).", "Erreur", JOptionPane.ERROR_MESSAGE);
+            if (!nomMatiereValide(addMatiereFrame, saisie)) return;
+            Double coefficient = parseCoef(coefField.getText());
+            if (coefficient == null || coefficient <= 0) {
+                JOptionPane.showMessageDialog(addMatiereFrame, "Coefficient invalide (ex : 1, 2, 0.5)", "Coefficient invalide", JOptionPane.ERROR_MESSAGE);
                 return;
             }
 
             Database.synchroniser();
 
             if (Database.ping()) {
-                if (MatiereDAO.inserer(saisie, 1.0) == -1) {
+                if (MatiereDAO.inserer(saisie, coefficient) == -1) {
                     JOptionPane.showMessageDialog(addMatiereFrame, "Erreur lors de l'enregistrement ou matière existante.", "Erreur", JOptionPane.ERROR_MESSAGE);
                     return;
                 }
-                CsvMirror.ajouterMatiere(saisie, true);
+                CsvMirror.ajouterMatiere(saisie, coefficient, true);
             } else {
                 if (CsvMirror.matiereExiste(saisie)) {
                     JOptionPane.showMessageDialog(addMatiereFrame, "Cette matière existe déjà.", "Erreur", JOptionPane.ERROR_MESSAGE);
                     return;
                 }
-                CsvMirror.ajouterMatiere(saisie, false);
+                CsvMirror.ajouterMatiere(saisie, coefficient, false);
                 if (Config.bddConfiguree()) JOptionPane.showMessageDialog(addMatiereFrame, "Connexion BDD indisponible. La matière a été enregistrée dans le fichier local.\nElle sera envoyée à la BDD dès la reconnexion.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
             }
 
@@ -710,6 +821,153 @@ public class Note {
 
         addMatiereFrame.getContentPane().add(newMatierePanel);
         addMatiereFrame.setVisible(true);
+    }
+
+    static boolean nomMatiereValide(java.awt.Component parent, String nom) {
+        if (nom.isEmpty()) {
+            JOptionPane.showMessageDialog(parent, "Le nom ne peut pas être vide.", "Erreur", JOptionPane.ERROR_MESSAGE);
+            return false;
+        }
+        if (nom.contains(";")) {
+            JOptionPane.showMessageDialog(parent, "Le caractère ';' est interdit dans le nom (séparateur du CSV).", "Erreur", JOptionPane.ERROR_MESSAGE);
+            return false;
+        }
+        return true;
+    }
+
+    // =====================================================================
+    // PARAMÈTRES D'UNE MATIÈRE (double-clic sur la matière) : nom, coefficient, suppression
+    // =====================================================================
+    static void ModifierMatiere(String nom) {
+        double coefActuel = CsvMirror.coefficientsMatieres().getOrDefault(nom, 1.0);
+
+        JFrame frame = new JFrame("Paramètres de la matière");
+        frame.setSize(600, 320);
+        frame.setLocationRelativeTo(fenetre);
+        frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        frame.getContentPane().setBackground(Theme.BACKGROUND);
+
+        JTextField nomField = new JTextField(nom, 20);
+        styleTextField(nomField);
+        JTextField coefField = new JTextField(formatCoef(coefActuel), 10);
+        styleTextField(coefField);
+        ((PlainDocument) coefField.getDocument()).setDocumentFilter(new CoefFilter());
+
+        JLabel labelNom = new JLabel("Nom de la matière :");
+        JLabel labelCoef = new JLabel("Coefficient :");
+        styleLabel(labelNom);
+        styleLabel(labelCoef);
+
+        JPanel centerPanel = new JPanel(new GridBagLayout());
+        centerPanel.setBackground(Theme.BACKGROUND);
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(8, 8, 8, 8);
+        gbc.anchor = GridBagConstraints.WEST;
+
+        gbc.gridx = 0; gbc.gridy = 0;
+        centerPanel.add(labelNom, gbc);
+        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
+        centerPanel.add(nomField, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 1; gbc.fill = GridBagConstraints.NONE;
+        centerPanel.add(labelCoef, gbc);
+        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
+        centerPanel.add(coefField, gbc);
+
+        JButton validButton = themedButton("Enregistrer");
+        validButton.addActionListener(e -> {
+            String nouveauNom = nomField.getText().trim();
+            if (!nomMatiereValide(frame, nouveauNom)) return;
+            Double coefficient = parseCoef(coefField.getText());
+            if (coefficient == null || coefficient <= 0) {
+                JOptionPane.showMessageDialog(frame, "Coefficient invalide (ex : 1, 2, 0.5)", "Coefficient invalide", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            boolean renomme = !nouveauNom.equals(nom);
+            if (renomme && !nouveauNom.equalsIgnoreCase(nom) && CsvMirror.matiereExiste(nouveauNom)) {
+                JOptionPane.showMessageDialog(frame, "Une matière porte déjà ce nom.", "Erreur", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+
+            Database.synchroniser();
+            boolean enLigne = Database.ping();
+
+            if (enLigne) {
+                if (!MatiereDAO.modifier(nom, nouveauNom, coefficient)) {
+                    JOptionPane.showMessageDialog(frame, "La base de données a refusé la modification.", "Erreur", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+            } else if (renomme && Config.bddConfiguree()) {
+                // Le renommage hors-ligne ne pourrait pas être retrouvé dans la BDD au retour en ligne
+                JOptionPane.showMessageDialog(frame, "Connexion BDD indisponible : impossible de renommer la matière hors-ligne.\nTu peux quand même changer son coefficient.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            CsvMirror.modifierMatiere(nom, nouveauNom, coefficient, enLigne);
+
+            rechargerApplication();
+            frame.dispose();
+        });
+
+        JButton deleteButton = Theme.boutonSecondaire("Supprimer la matière");
+        deleteButton.setForeground(Theme.RETARD);
+        deleteButton.addActionListener(e -> {
+            int nb = CsvMirror.listerNotes(nom).size();
+            int choix = JOptionPane.showConfirmDialog(frame,
+                    "Supprimer « " + nom + " »" + (nb > 0 ? " et ses " + nb + " note(s)" : "") + " ?\nCette action est définitive.",
+                    "Supprimer la matière", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (choix != JOptionPane.YES_OPTION) return;
+
+            Database.synchroniser();
+            if (Database.ping()) {
+                if (!MatiereDAO.supprimer(nom)) {
+                    JOptionPane.showMessageDialog(frame, "La base de données a refusé la suppression.", "Erreur", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+            } else if (Config.bddConfiguree()) {
+                JOptionPane.showMessageDialog(frame, "Connexion BDD indisponible : impossible de supprimer une matière hors-ligne.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            CsvMirror.supprimerMatiere(nom);
+
+            rechargerApplication();
+            frame.dispose();
+        });
+
+        JButton annulButton = Theme.boutonSecondaire("Annuler");
+        annulButton.addActionListener(e -> frame.dispose());
+
+        JPanel btnPanel = new JPanel();
+        btnPanel.setBackground(Theme.BACKGROUND);
+        btnPanel.add(validButton);
+        btnPanel.add(annulButton);
+        btnPanel.add(deleteButton);
+
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBackground(Theme.BACKGROUND);
+        panel.setBorder(new EmptyBorder(20, 20, 20, 20));
+        panel.add(centerPanel, BorderLayout.CENTER);
+        panel.add(btnPanel, BorderLayout.SOUTH);
+
+        frame.getContentPane().add(panel);
+        frame.getRootPane().setDefaultButton(validButton);
+        frame.setVisible(true);
+    }
+
+    /** Double-clic sur une matière (1re colonne des notes, ou n'importe où dans les moyennes) : ses paramètres. */
+    static void doubleClicMatiere(JTable table, boolean colonneMatiereSeulement) {
+        // mousePressed plutôt que mouseClicked : un "clic" n'est pas signalé si la souris bouge d'un pixel pendant l'appui
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (e.getClickCount() != 2 || !SwingUtilities.isLeftMouseButton(e)) return;
+                int row = table.rowAtPoint(e.getPoint());
+                int col = table.columnAtPoint(e.getPoint());
+                if (row < 0 || col < 0) return;
+                if (colonneMatiereSeulement && table.convertColumnIndexToModel(col) != 0) return;
+                Object nom = table.getModel().getValueAt(table.convertRowIndexToModel(row), 0);
+                if (nom != null) ModifierMatiere(nom.toString());
+            }
+        });
     }
 
     static void AddNote() {
@@ -943,7 +1201,8 @@ public class Note {
             fenetre = frame;
             frame.getContentPane().setBackground(Theme.BACKGROUND);
 
-            JPanel entete = Theme.entete("Notes et moyennes", Theme.info("Clique sur une note pour la sélectionner"));
+            JPanel entete = Theme.entete("Notes et moyennes",
+                    Theme.info("Clique sur une note pour la sélectionner · double-clique sur une matière pour la modifier"));
 
             DefaultTableModel tableUnClickable = new DefaultTableModel(donneesInitiales, colonnesInitiales) {
                 @Override
@@ -955,34 +1214,30 @@ public class Note {
             tableNote = new JTable(tableUnClickable);
             styleTable(tableNote);
             tableNote.setCellSelectionEnabled(true); // on clique sur la case d'une note
+            doubleClicMatiere(tableNote, true);
 
             JScrollPane scroll = new JScrollPane(tableNote);
 
-            DefaultTableModel modelMoyenne = new DefaultTableModel(new String[]{"Matière", "Moyenne"}, 0) {
-                @Override
-                public boolean isCellEditable(int row, int column) {
-                    return false;
-                }
-            };
+            labelGenerale = new JLabel(" ");
+            labelGenerale.setFont(Theme.FONT_SECTION);
+            labelGenerale.setBorder(new EmptyBorder(0, 4, 8, 0));
 
-            ListMatiere();
-            List<Double> moyennesInitiales = calculMoyenneGenerale();
-            for (int i = 0; i < nomsMatieres.length; i++) {
-                Double m = (i < moyennesInitiales.size()) ? moyennesInitiales.get(i) : null;
-                String affichage = (m == null) ? "" : String.format("%.2f", m);
-                modelMoyenne.addRow(new Object[]{ nomsMatieres[i], affichage });
-            }
-
-            tableMoyenne = new JTable(modelMoyenne);
+            tableMoyenne = new JTable(modeleMoyennes());
             styleTable(tableMoyenne);
+            doubleClicMatiere(tableMoyenne, false);
 
             JScrollPane scrollMoyenne = new JScrollPane(tableMoyenne);
+
+            JPanel blocMoyennes = new JPanel(new BorderLayout());
+            blocMoyennes.setBackground(Theme.BACKGROUND);
+            blocMoyennes.add(labelGenerale, BorderLayout.NORTH);
+            blocMoyennes.add(Theme.encadrer(scrollMoyenne), BorderLayout.CENTER);
 
             JPanel tablesPanel = new JPanel(new GridLayout(2, 1, 0, 16));
             tablesPanel.setBackground(Theme.BACKGROUND);
             tablesPanel.setBorder(new EmptyBorder(0, 24, 0, 24));
             tablesPanel.add(Theme.encadrer(scroll));
-            tablesPanel.add(Theme.encadrer(scrollMoyenne));
+            tablesPanel.add(blocMoyennes);
 
             JButton btnNote = themedButton("Ajouter Une Note");
             btnNote.addActionListener(e -> AddNote());

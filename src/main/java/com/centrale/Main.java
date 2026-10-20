@@ -55,7 +55,7 @@ import javax.swing.border.EmptyBorder;
 
 /**
  * Tableau de bord de Centrale Étudiant : un résumé de chaque programme
- * (emploi du temps de demain, devoirs urgents, moyennes, mails non lus),
+ * (cours du jour, devoirs urgents, moyennes, mails non lus),
  * et une barre de menus pour ouvrir chaque programme dans sa propre fenêtre.
  */
 public class Main {
@@ -75,6 +75,11 @@ public class Main {
     static JLabel miseAJour;
     static JMenu menuMails;
     static long dernierRafraichissementLocal = 0;
+
+    /** Dernier emploi du temps chargé : la carte est redessinée chaque minute sans retélécharger. */
+    static Calendar.Edt edt;
+    /** Derniers mails non lus dans Gmail : filtrés à nouveau quand un mail est ouvert dans la boîte intégrée. */
+    static List<Mails.Mail> mailsNonLus;
 
     // =====================================================================
     // COMPOSANTS COMMUNS
@@ -353,62 +358,106 @@ public class Main {
     static void ouvrirMails()         { ouvrir(() -> Mails.fenetre, () -> Mails.main(new String[0])); }
 
     // =====================================================================
-    // CARTE 1 : EMPLOI DU TEMPS DE DEMAIN
+    // CARTE 1 : COURS DU JOUR
+    //
+    // Les cours d'aujourd'hui tant qu'il en reste ; une fois le dernier terminé
+    // (ou s'il n'y a pas cours), ceux du prochain jour de cours.
     // =====================================================================
     static void chargerEmploiDuTemps() {
         carteEdt.message("Chargement de l'emploi du temps...", Theme.TEXT_DISCRET);
 
-        new SwingWorker<List<Evenement>, Void>() {
+        new SwingWorker<Calendar.Edt, Void>() {
             @Override
-            protected List<Evenement> doInBackground() {
-                return Calendar.requestHttp();
+            protected Calendar.Edt doInBackground() {
+                return Calendar.charger(); // sans internet : dernière sauvegarde
             }
 
             @Override
             protected void done() {
-                List<Evenement> tous;
                 try {
-                    tous = get();
+                    edt = get();
                 } catch (Exception e) {
+                    edt = null;
                     carteEdt.message("Impossible de récupérer l'emploi du temps.\n" + cause(e), Theme.RETARD);
                     return;
                 }
-                Map<String, Color> couleurs = couleursPour(tous.stream().map(Evenement::getTitre).toList());
-
-                // Demain ; s'il n'y a pas cours demain (week-end...), le prochain jour de cours
-                LocalDate demain = LocalDate.now().plusDays(1);
-                LocalDate jour = demain;
-                List<Evenement> duJour = coursDu(tous, jour);
-                for (int i = 1; duJour.isEmpty() && i <= 14; i++) {
-                    jour = demain.plusDays(i);
-                    duJour = coursDu(tous, jour);
-                }
-
-                if (duJour.isEmpty()) {
-                    carteEdt.message("Aucun cours prévu dans les deux prochaines semaines.", Theme.TEXT_DISCRET);
-                    return;
-                }
-
-                String titre = jour.equals(demain)
-                        ? "Demain · " + jour.format(JOUR_LONG)
-                        : "Pas cours demain · prochains cours " + jour.format(JOUR_LONG);
-                JLabel enTete = label(majuscule(titre), Theme.FONT_BUTTON, jour.equals(demain) ? Theme.ACCENT : Theme.ATTENTION);
-                enTete.setBorder(new EmptyBorder(0, 2, 4, 0));
-
-                List<JComponent> lignes = new ArrayList<>();
-                for (Evenement e : duJour) {
-                    JPanel l = ligne(couleurs.getOrDefault(e.getTitre(), Theme.ACCENT), Main::ouvrirEmploiDuTemps);
-                    JLabel horaire = label(e.getDebut().format(HEURE) + " – " + e.getFin().format(HEURE),
-                            Theme.FONT_TABLE.deriveFont(Font.BOLD), Theme.TEXT_DISCRET);
-                    horaire.setPreferredSize(new Dimension(100, horaire.getPreferredSize().height));
-                    String salle = (e.getSalle() == null) ? "" : e.getSalle().replace("\n", " ").trim();
-                    l.add(horaire, BorderLayout.WEST);
-                    l.add(deuxLignes(e.getTitre(), Theme.TEXT_PRIMARY, salle.isEmpty() ? null : salle), BorderLayout.CENTER);
-                    lignes.add(l);
-                }
-                carteEdt.remplir(enTete, lignes);
+                afficherEmploiDuTemps();
             }
         }.execute();
+    }
+
+    static void afficherEmploiDuTemps() {
+        if (edt == null) return;
+        List<Evenement> tous = edt.evenements();
+        Map<String, Color> couleurs = couleursPour(tous.stream().map(Evenement::getTitre).toList());
+        LocalDateTime maintenant = LocalDateTime.now();
+        LocalDate aujourdhui = maintenant.toLocalDate();
+
+        List<Evenement> duJour = coursDu(tous, aujourdhui);
+        boolean resteAujourdhui = duJour.stream().anyMatch(e -> e.getFin().isAfter(maintenant));
+        boolean finiAujourdhui = !duJour.isEmpty() && !resteAujourdhui;
+
+        // Plus de cours aujourd'hui : prochain jour de cours (dans les deux semaines)
+        LocalDate jour = aujourdhui;
+        if (!resteAujourdhui) {
+            duJour = List.of();
+            for (int i = 1; duJour.isEmpty() && i <= 14; i++) {
+                jour = aujourdhui.plusDays(i);
+                duJour = coursDu(tous, jour);
+            }
+        }
+
+        if (duJour.isEmpty()) {
+            carteEdt.message((finiAujourdhui ? "Journée terminée. " : "")
+                    + "Aucun cours prévu dans les deux prochaines semaines."
+                    + (edt.horsLigne() ? "\n" + edt.libelleHorsLigne() : ""), Theme.TEXT_DISCRET);
+            return;
+        }
+
+        String titre;
+        Color couleurTitre = Theme.ACCENT;
+        if (jour.equals(aujourdhui)) {
+            titre = "Aujourd'hui · " + jour.format(JOUR_LONG);
+        } else {
+            String quand = jour.equals(aujourdhui.plusDays(1)) ? "Demain" : majuscule(jour.format(JOUR_LONG));
+            titre = (finiAujourdhui ? "Journée terminée · " : "Pas cours aujourd'hui · ")
+                    + quand + (jour.equals(aujourdhui.plusDays(1)) ? " · " + jour.format(JOUR_LONG) : "");
+            couleurTitre = Theme.ATTENTION;
+        }
+
+        JPanel enTete = new JPanel(new BorderLayout(8, 0));
+        enTete.setOpaque(false);
+        enTete.setBorder(new EmptyBorder(0, 2, 4, 0));
+        enTete.add(label(majuscule(titre), Theme.FONT_BUTTON, couleurTitre), BorderLayout.CENTER);
+        if (edt.horsLigne()) {
+            JLabel horsLigne = label(edt.libelleHorsLigne(), Theme.FONT_PETIT, Theme.ATTENTION);
+            horsLigne.setToolTipText(edt.erreur());
+            enTete.add(horsLigne, BorderLayout.EAST);
+        }
+
+        List<JComponent> lignes = new ArrayList<>();
+        for (Evenement e : duJour) {
+            boolean termine = !e.getFin().isAfter(maintenant);
+            boolean enCours = !termine && !e.getDebut().isAfter(maintenant);
+
+            // Cours terminé : grisé ; cours en cours : signalé à droite
+            Color bande = termine ? Theme.BORDER : couleurs.getOrDefault(e.getTitre(), Theme.ACCENT);
+            JPanel l = ligne(bande, Main::ouvrirEmploiDuTemps);
+            JLabel horaire = label(e.getDebut().format(HEURE) + " – " + e.getFin().format(HEURE),
+                    Theme.FONT_TABLE.deriveFont(Font.BOLD), Theme.TEXT_DISCRET);
+            horaire.setPreferredSize(new Dimension(100, horaire.getPreferredSize().height));
+            String salle = (e.getSalle() == null) ? "" : e.getSalle().replace("\n", " ").trim();
+            l.add(horaire, BorderLayout.WEST);
+            l.add(deuxLignes(e.getTitre(), termine ? Theme.TEXT_DISCRET : Theme.TEXT_PRIMARY,
+                    salle.isEmpty() ? null : salle), BorderLayout.CENTER);
+            if (enCours) {
+                l.add(label("En cours", Theme.FONT_BUTTON, Theme.SUCCES), BorderLayout.EAST);
+            } else if (termine) {
+                l.add(label("Terminé", Theme.FONT_PETIT, Theme.TEXT_DISCRET), BorderLayout.EAST);
+            }
+            lignes.add(l);
+        }
+        carteEdt.remplir(enTete, lignes);
     }
 
     static List<Evenement> coursDu(List<Evenement> tous, LocalDate jour) {
@@ -493,8 +542,8 @@ public class Main {
     // CARTE 3 : MOYENNES PAR MATIÈRE
     // =====================================================================
 
-    /** Moyenne d'une matière (null = pas encore de note). */
-    record Moyenne(String matiere, Double valeur, int nbNotes) {}
+    /** Moyenne d'une matière (null = pas encore de note) et coefficient de la matière. */
+    record Moyenne(String matiere, Double valeur, int nbNotes, double coefficient) {}
 
     static void chargerMoyennes() {
         new SwingWorker<List<Moyenne>, Void>() {
@@ -505,7 +554,8 @@ public class Main {
 
                 // Même calcul que Note.calculMoyenneGenerale() : somme((note/quotient) x coef) / somme(coef) x 20
                 List<Moyenne> res = new ArrayList<>();
-                for (String matiere : Note.CsvMirror.listerMatieres()) {
+                Map<String, Double> coefs = Note.CsvMirror.coefficientsMatieres();
+                for (String matiere : coefs.keySet()) {
                     double sommePonderee = 0, sommeCoefs = 0;
                     int nb = 0;
                     for (Note.CsvMirror.Entry e : entrees) {
@@ -515,7 +565,7 @@ public class Main {
                         sommeCoefs += e.coefficient;
                         nb++;
                     }
-                    res.add(new Moyenne(matiere, sommeCoefs > 0 ? sommePonderee / sommeCoefs * 20 : null, nb));
+                    res.add(new Moyenne(matiere, sommeCoefs > 0 ? sommePonderee / sommeCoefs * 20 : null, nb, coefs.get(matiere)));
                 }
                 return res;
             }
@@ -534,11 +584,10 @@ public class Main {
                     return;
                 }
 
-                // Moyenne générale : moyenne des matières qui ont au moins une note
-                double somme = 0;
-                int nb = 0;
+                // Moyenne générale : moyennes des matières pondérées par leur coefficient (matières notées seulement)
+                double somme = 0, nb = 0;
                 for (Moyenne m : moyennes) {
-                    if (m.valeur() != null) { somme += m.valeur(); nb++; }
+                    if (m.valeur() != null) { somme += m.valeur() * m.coefficient(); nb += m.coefficient(); }
                 }
                 JPanel enTete = new JPanel(new BorderLayout());
                 enTete.setOpaque(false);
@@ -552,7 +601,8 @@ public class Main {
                     Color couleur = (m.valeur() == null) ? Theme.BORDER : couleurMoyenne(m.valeur());
                     JPanel l = ligne(couleur, Main::ouvrirNotes);
                     l.add(deuxLignes(m.matiere(), Theme.TEXT_PRIMARY,
-                            m.nbNotes() + " note" + (m.nbNotes() > 1 ? "s" : "")), BorderLayout.CENTER);
+                            m.nbNotes() + " note" + (m.nbNotes() > 1 ? "s" : "")
+                            + "  ·  coef " + Note.formatCoef(m.coefficient())), BorderLayout.CENTER);
 
                     JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
                     droite.setOpaque(false);
@@ -592,48 +642,53 @@ public class Main {
 
             @Override
             protected void done() {
-                List<Mails.Mail> tous;
                 try {
-                    tous = get();
+                    mailsNonLus = get();
                 } catch (Exception e) {
+                    mailsNonLus = null;
                     voyantMails.etat(Theme.TEXT_DISCRET, false, "Mails indisponibles");
                     menuMails.setText("Mails");
                     carteMails.message("Impossible de récupérer les mails.\n" + cause(e), Theme.RETARD);
                     return;
                 }
-
-                List<Mails.Mail> nonLus = tous.stream().filter(m -> !m.lu).toList();
-                if (nonLus.isEmpty()) {
-                    voyantMails.etat(Theme.SUCCES, false, "Aucun mail non lu");
-                    compteurMails.setText("");
-                    menuMails.setText("Mails");
-                    carteMails.message("Aucun mail non lu de l'université.", Theme.SUCCES);
-                    return;
-                }
-
-                // Voyant rouge qui clignote : il y a des mails à lire
-                String info = nonLus.size() + " mail" + (nonLus.size() > 1 ? "s" : "") + " non lu" + (nonLus.size() > 1 ? "s" : "");
-                voyantMails.etat(Theme.RETARD, true, info);
-                compteurMails.setText(String.valueOf(nonLus.size()));
-                menuMails.setText("Mails (" + nonLus.size() + ")");
-
-                List<JComponent> lignes = new ArrayList<>();
-                for (Mails.Mail m : nonLus.subList(0, Math.min(MAX_MAILS, nonLus.size()))) {
-                    JPanel l = ligne(Theme.ACCENT, Main::ouvrirMails);
-                    l.add(deuxLignes(m.expediteur, Theme.TEXT_PRIMARY, m.objet), BorderLayout.CENTER);
-                    JLabel date = label(Mails.dateCourte(m.date), Theme.FONT_PETIT, Theme.ACCENT);
-                    date.setVerticalAlignment(SwingConstants.TOP);
-                    l.add(date, BorderLayout.EAST);
-                    lignes.add(l);
-                }
-                if (nonLus.size() > MAX_MAILS) {
-                    JLabel plus = label("+ " + (nonLus.size() - MAX_MAILS) + " autre(s) non lu(s)", Theme.FONT_PETIT, Theme.TEXT_DISCRET);
-                    plus.setHorizontalAlignment(SwingConstants.CENTER);
-                    lignes.add(plus);
-                }
-                carteMails.remplir(null, lignes);
+                afficherMails();
             }
         }.execute();
+    }
+
+    /** Seulement les mails pas encore vus (ni lus dans Gmail, ni ouverts dans la boîte intégrée). */
+    static void afficherMails() {
+        if (mailsNonLus == null) return;
+        List<Mails.Mail> nonLus = mailsNonLus.stream().filter(m -> !m.dejaVu()).toList();
+        if (nonLus.isEmpty()) {
+            voyantMails.etat(Theme.SUCCES, false, "Aucun mail non lu");
+            compteurMails.setText("");
+            menuMails.setText("Mails");
+            carteMails.message("Aucun mail non lu de l'université.", Theme.SUCCES);
+            return;
+        }
+
+        // Voyant rouge qui clignote : il y a des mails à lire
+        String info = nonLus.size() + " mail" + (nonLus.size() > 1 ? "s" : "") + " non lu" + (nonLus.size() > 1 ? "s" : "");
+        voyantMails.etat(Theme.RETARD, true, info);
+        compteurMails.setText(String.valueOf(nonLus.size()));
+        menuMails.setText("Mails (" + nonLus.size() + ")");
+
+        List<JComponent> lignes = new ArrayList<>();
+        for (Mails.Mail m : nonLus.subList(0, Math.min(MAX_MAILS, nonLus.size()))) {
+            JPanel l = ligne(Theme.ACCENT, Main::ouvrirMails);
+            l.add(deuxLignes(m.expediteur, Theme.TEXT_PRIMARY, m.objet), BorderLayout.CENTER);
+            JLabel date = label(Mails.dateCourte(m.date), Theme.FONT_PETIT, Theme.ACCENT);
+            date.setVerticalAlignment(SwingConstants.TOP);
+            l.add(date, BorderLayout.EAST);
+            lignes.add(l);
+        }
+        if (nonLus.size() > MAX_MAILS) {
+            JLabel plus = label("+ " + (nonLus.size() - MAX_MAILS) + " autre(s) non lu(s)", Theme.FONT_PETIT, Theme.TEXT_DISCRET);
+            plus.setHorizontalAlignment(SwingConstants.CENTER);
+            lignes.add(plus);
+        }
+        carteMails.remplir(null, lignes);
     }
 
     static String cause(Exception e) {
@@ -765,7 +820,7 @@ public class Main {
             JPanel haut = Theme.entete("Tableau de bord", miseAJour);
 
             // --- les 4 cartes ---
-            carteEdt = new Carte("Emploi du temps", "Semaine", Main::ouvrirEmploiDuTemps);
+            carteEdt = new Carte("Cours du jour", "Semaine", Main::ouvrirEmploiDuTemps);
             carteDevoirs = new Carte("Devoirs urgents", "Tous les devoirs", Main::ouvrirDevoirs);
             carteMoyennes = new Carte("Moyennes", "Mes notes", Main::ouvrirNotes);
             carteMails = new Carte("Boîte de réception", "Tous les mails", Main::ouvrirMails);
@@ -799,6 +854,12 @@ public class Main {
 
             // Nouveaux mails vérifiés toutes les 5 minutes
             new Timer(5 * 60 * 1000, e -> chargerMails()).start();
+
+            // Un mail ouvert dans la boîte intégrée n'est plus compté comme non lu
+            Mails.Vus.ecouteurs.add(() -> SwingUtilities.invokeLater(Main::afficherMails));
+
+            // Chaque minute : cours terminés grisés, passage au jour suivant après le dernier cours
+            new Timer(60 * 1000, e -> afficherEmploiDuTemps()).start();
 
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);

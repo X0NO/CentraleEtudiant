@@ -4,15 +4,22 @@ import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Font;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -80,20 +87,80 @@ public class Mails {
     // MODÈLE
     // =====================================================================
     static final class Mail {
+        final String id;           // identifiant unique (en-tête Message-ID), pour se souvenir des mails vus
         final String expediteur;   // nom affiché (ou adresse s'il n'y a pas de nom)
         final String adresse;
         final String objet;
         final LocalDateTime date;
-        final boolean lu;
+        final boolean lu;          // lu dans Gmail
         final String corps;
 
-        Mail(String expediteur, String adresse, String objet, LocalDateTime date, boolean lu, String corps) {
+        Mail(String id, String expediteur, String adresse, String objet, LocalDateTime date, boolean lu, String corps) {
+            this.id = id;
             this.expediteur = expediteur;
             this.adresse = adresse;
             this.objet = objet;
             this.date = date;
             this.lu = lu;
             this.corps = corps;
+        }
+
+        /** Déjà vu : lu dans Gmail, ou ouvert dans la boîte intégrée. */
+        boolean dejaVu() {
+            return lu || Vus.contient(id);
+        }
+    }
+
+    // =====================================================================
+    // MAILS DÉJÀ VUS DANS L'APPLI
+    //
+    // Le dossier Gmail est ouvert en lecture seule (rien n'est marqué comme lu
+    // dans Gmail). Les mails ouverts dans la boîte intégrée sont donc retenus
+    // ici, dans mails_vus.txt (un Message-ID par ligne), pour les griser et ne
+    // plus les compter dans le voyant du tableau de bord.
+    // =====================================================================
+    static final class Vus {
+        static final Path FICHIER = Config.fichier("mails_vus.txt");
+        /** On ne garde que les plus récents : le fichier ne grossit pas indéfiniment. */
+        static final int MAX = 2000;
+
+        private static Set<String> ids;
+        /** Appelé quand un mail vient d'être vu (le tableau de bord met son voyant à jour). */
+        static final List<Runnable> ecouteurs = new CopyOnWriteArrayList<>();
+
+        private static synchronized Set<String> ids() {
+            if (ids == null) {
+                ids = new LinkedHashSet<>();
+                try {
+                    if (Files.exists(FICHIER)) {
+                        for (String l : Files.readAllLines(FICHIER, StandardCharsets.UTF_8)) {
+                            if (!l.isBlank()) ids.add(l.trim());
+                        }
+                    }
+                } catch (IOException e) {
+                    System.err.println("Lecture de " + FICHIER + " impossible : " + e.getMessage());
+                }
+            }
+            return ids;
+        }
+
+        static synchronized boolean contient(String id) {
+            return id != null && ids().contains(id);
+        }
+
+        static void marquer(String id) {
+            synchronized (Vus.class) {
+                if (id == null || !ids().add(id)) return;
+                while (ids.size() > MAX) ids.remove(ids.iterator().next());
+                try {
+                    Path tmp = FICHIER.resolveSibling(FICHIER.getFileName() + ".tmp");
+                    Files.write(tmp, ids, StandardCharsets.UTF_8);
+                    Files.move(tmp, FICHIER, StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException e) {
+                    System.err.println("Écriture de " + FICHIER + " impossible : " + e.getMessage());
+                }
+            }
+            for (Runnable r : ecouteurs) r.run();
         }
     }
 
@@ -141,6 +208,7 @@ public class Mails {
                 FetchProfile fp = new FetchProfile();
                 fp.add(FetchProfile.Item.ENVELOPE);
                 fp.add(FetchProfile.Item.FLAGS);
+                fp.add("Message-ID");
                 inbox.fetch(recents, fp);
 
                 for (Message m : recents) {
@@ -154,6 +222,9 @@ public class Mails {
                     LocalDateTime date = (d == null) ? null
                             : d.toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime();
                     boolean lu = m.isSet(Flags.Flag.SEEN);
+                    String[] messageId = m.getHeader("Message-ID");
+                    String id = (messageId != null && messageId.length > 0) ? messageId[0].trim()
+                            : from.getAddress() + "|" + d + "|" + objet; // mail sans Message-ID (rare)
 
                     String corps = "";
                     if (avecCorps) {
@@ -163,7 +234,7 @@ public class Mails {
                             corps = "(contenu illisible : " + e.getMessage() + ")";
                         }
                     }
-                    mails.add(new Mail(nom, from.getAddress(), objet, date, lu, corps == null ? "" : corps.trim()));
+                    mails.add(new Mail(id, nom, from.getAddress(), objet, date, lu, corps == null ? "" : corps.trim()));
                 }
             }
         }
@@ -308,6 +379,7 @@ public class Mails {
     static JLabel enteteMail;
     static JTextArea corpsMail;
     static JButton btnActualiser;
+    static LocalDateTime derniereMaj;
 
     static final DateTimeFormatter HEURE = DateTimeFormatter.ofPattern("HH:mm");
     static final DateTimeFormatter JOUR = DateTimeFormatter.ofPattern("dd/MM/yyyy");
@@ -321,7 +393,7 @@ public class Mails {
         return d.format(JOUR);
     }
 
-    /** Mails non lus en gras et en couleur d'accent, comme dans Gmail. */
+    /** Mails non lus en gras et en couleur d'accent (comme dans Gmail), mails déjà vus grisés. */
     static class RenduMail extends DefaultTableCellRenderer {
         @Override
         public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected,
@@ -329,17 +401,36 @@ public class Mails {
             super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
             setBorder(new EmptyBorder(0, 8, 0, 8));
             int i = table.convertRowIndexToModel(row);
-            boolean nonLu = i < mails.size() && !mails.get(i).lu;
-            setFont(nonLu ? Theme.FONT_TABLE.deriveFont(Font.BOLD) : Theme.FONT_TABLE);
+            boolean vu = i >= mails.size() || mails.get(i).dejaVu();
+            setFont(vu ? Theme.FONT_TABLE : Theme.FONT_TABLE.deriveFont(Font.BOLD));
             if (!isSelected) {
                 setBackground(row % 2 == 0 ? Theme.SURFACE : Theme.SURFACE_ALT);
-                setForeground(nonLu && column == 0 ? Theme.ACCENT : Theme.TEXT_PRIMARY);
+                if (vu) setForeground(Theme.TEXT_DISCRET);
+                else setForeground(column == 0 ? Theme.ACCENT : Theme.TEXT_PRIMARY);
             }
             return this;
         }
     }
 
+    static long nombreNonVus(List<Mail> liste) {
+        return liste.stream().filter(m -> !m.dejaVu()).count();
+    }
+
+    static void afficherStatut() {
+        long nonVus = nombreNonVus(mails);
+        statut.setForeground(Theme.TEXT_DISCRET);
+        statut.setText(mails.size() + " mail" + (mails.size() > 1 ? "s" : "") + " de @" + DOMAINE
+                + "   ·   " + nonVus + " non lu" + (nonVus > 1 ? "s" : "")
+                + "   ·   mis à jour à " + (derniereMaj == null ? "" : derniereMaj.format(HEURE)));
+    }
+
     static void afficherMail(Mail m) {
+        // Ouvert dans la boîte intégrée : le mail est retenu comme vu (grisé, plus compté comme non lu)
+        if (!m.dejaVu()) {
+            Vus.marquer(m.id);
+            tableMails.repaint();
+            afficherStatut();
+        }
         String date = (m.date == null) ? "" : m.date.format(DateTimeFormatter.ofPattern("EEEE d MMMM yyyy 'à' HH:mm", Locale.FRENCH));
         enteteMail.setText("<html><b style='font-size:13px'>" + echapper(m.objet) + "</b><br>"
                 + "<span style='color:" + Theme.hex(Theme.ACCENT) + "'>" + echapper(m.expediteur) + "</span> &lt;" + echapper(m.adresse) + "&gt;<br>"
@@ -385,18 +476,13 @@ public class Mails {
                     model.addRow(new Object[]{ m.expediteur, m.objet, dateCourte(m.date) });
                 }
 
-                long nonLus = mails.stream().filter(m -> !m.lu).count();
-                statut.setForeground(Theme.TEXT_DISCRET);
-                statut.setText(mails.size() + " mail" + (mails.size() > 1 ? "s" : "") + " de @" + DOMAINE
-                        + "   ·   " + nonLus + " non lu" + (nonLus > 1 ? "s" : "")
-                        + "   ·   mis à jour à " + LocalDateTime.now().format(HEURE));
+                derniereMaj = LocalDateTime.now();
+                afficherStatut();
 
-                if (!mails.isEmpty()) {
-                    tableMails.setRowSelectionInterval(0, 0);
-                } else {
-                    enteteMail.setText("");
-                    corpsMail.setText("Aucun mail reçu d'une adresse @" + DOMAINE + ".");
-                }
+                // Aucun mail ouvert d'office : sinon le plus récent serait marqué comme vu sans avoir été lu
+                enteteMail.setText("");
+                corpsMail.setText(mails.isEmpty() ? "Aucun mail reçu d'une adresse @" + DOMAINE + "."
+                        : "Clique sur un mail pour le lire.");
             }
         }.execute();
     }

@@ -20,6 +20,10 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -59,12 +63,80 @@ public class Calendar {
         return LocalDate.now();
     }
 
-    /** Emploi du temps depuis le lien iCal des paramètres (voir Config). */
-    static List<Evenement> requestHttp() {
-        return requestHttp(Config.get(Config.ICAL));
+    // =====================================================================
+    // SAUVEGARDE HORS-LIGNE
+    //
+    // Chaque emploi du temps téléchargé avec succès est copié dans edt_backup.ics
+    // (dossier de l'utilisateur, voir Config). Sans internet, ou si le serveur ADE
+    // ne répond pas, c'est cette dernière copie qui est affichée.
+    // =====================================================================
+    static final Path SAUVEGARDE = Config.fichier("edt_backup.ics");
+
+    /**
+     * Emploi du temps chargé.
+     * @param sauvegardeDu null = téléchargé à l'instant ; sinon date de la copie hors-ligne affichée
+     * @param erreur       raison pour laquelle le téléchargement a échoué (null si en ligne)
+     */
+    record Edt(List<Evenement> evenements, LocalDateTime sauvegardeDu, String erreur) {
+        boolean horsLigne() {
+            return sauvegardeDu != null;
+        }
+
+        /** "Hors-ligne · copie du 20/10 à 08:12" */
+        String libelleHorsLigne() {
+            return "Hors-ligne · copie du " + sauvegardeDu.format(DateTimeFormatter.ofPattern("dd/MM 'à' HH:mm"));
+        }
     }
 
+    /**
+     * Télécharge l'emploi du temps (lien des Paramètres) et le sauvegarde ;
+     * en cas d'échec, relit la dernière sauvegarde. Exception seulement s'il n'y a ni internet ni sauvegarde.
+     */
+    static Edt charger() {
+        String lien = Config.get(Config.ICAL);
+        if (lien == null || lien.isBlank()) {
+            throw new IllegalStateException("Aucun lien iCal : renseigne-le dans les Paramètres.");
+        }
+        try {
+            String ics = telecharger(lien);
+            List<Evenement> evenements = convertirEvents(parseIcal(ics));
+            sauvegarder(ics);
+            return new Edt(evenements, null, null);
+        } catch (IllegalStateException e) {
+            if (!Files.exists(SAUVEGARDE)) throw e;
+            try {
+                String ics = Files.readString(SAUVEGARDE, StandardCharsets.UTF_8);
+                LocalDateTime date = LocalDateTime.ofInstant(
+                        Files.getLastModifiedTime(SAUVEGARDE).toInstant(), ZoneId.systemDefault());
+                return new Edt(convertirEvents(parseIcal(ics)), date, e.getMessage());
+            } catch (IOException | RuntimeException lecture) {
+                throw e; // sauvegarde illisible : on garde l'erreur d'origine
+            }
+        }
+    }
+
+    /** Écriture atomique : une sauvegarde à moitié écrite ne remplace jamais la précédente. */
+    private static void sauvegarder(String ics) {
+        try {
+            Path tmp = SAUVEGARDE.resolveSibling(SAUVEGARDE.getFileName() + ".tmp");
+            Files.writeString(tmp, ics, StandardCharsets.UTF_8);
+            Files.move(tmp, SAUVEGARDE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            System.err.println("Sauvegarde de l'emploi du temps impossible : " + e.getMessage());
+        }
+    }
+
+    /** Emploi du temps depuis le lien iCal des paramètres (voir Config), avec secours hors-ligne. */
+    static List<Evenement> requestHttp() {
+        return charger().evenements();
+    }
+
+    /** Télécharge et lit un lien iCal, sans sauvegarde (utilisé aussi par le bouton "Tester" des Paramètres). */
     static List<Evenement> requestHttp(String lien) {
+        return convertirEvents(parseIcal(telecharger(lien)));
+    }
+
+    private static String telecharger(String lien) {
         if (lien == null || lien.isBlank()) {
             throw new IllegalStateException("Aucun lien iCal : renseigne-le dans les Paramètres.");
         }
@@ -88,13 +160,12 @@ public class Calendar {
             if (response.statusCode() != 200) {
                 throw new IllegalStateException("Le serveur a répondu " + response.statusCode() + " (lien iCal expiré ?)");
             }
-            List<VEvent> vevents = parseIcal(response.body());
-            return convertirEvents(vevents);
+            return response.body();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("HTTP request interrupted", e);
+            throw new IllegalStateException("Téléchargement interrompu", e);
         } catch (IOException e) {
-            throw new IllegalStateException("HTTP request failed", e);
+            throw new IllegalStateException("Pas de connexion au serveur de l'emploi du temps", e);
         }
     }
 
@@ -487,8 +558,10 @@ public class Calendar {
         Config.demanderSiPremierLancement();
 
         List<Evenement> evenements;
+        Edt edt = null;
         try {
-            evenements = requestHttp();
+            edt = charger();
+            evenements = new ArrayList<>(edt.evenements());
         } catch (IllegalStateException e) {
             JOptionPane.showMessageDialog(null, "Impossible de récupérer l'emploi du temps :\n" + e.getMessage(),
                     "Erreur", JOptionPane.ERROR_MESSAGE);
@@ -498,6 +571,7 @@ public class Calendar {
         attribuerCouleurs(evenements);
 
         final List<Evenement> tousLesEvenements = evenements;
+        final Edt charge = edt;
         SwingUtilities.invokeLater(() -> {
             JFrame frame = new JFrame("Centrale Étudiant · Emploi du temps");
             frame.setSize(1100, 800);
@@ -507,7 +581,14 @@ public class Calendar {
 
             VueSemaine vue = new VueSemaine(tousLesEvenements);
 
-            JPanel entete = Theme.entete("Emploi du temps", null);
+            // Pas d'internet : on affiche la dernière sauvegarde et on le signale dans l'en-tête
+            JLabel horsLigne = null;
+            if (charge != null && charge.horsLigne()) {
+                horsLigne = Theme.info(charge.libelleHorsLigne());
+                horsLigne.setForeground(Theme.ATTENTION);
+                horsLigne.setToolTipText(charge.erreur());
+            }
+            JPanel entete = Theme.entete("Emploi du temps", horsLigne);
 
             JLabel semaine = new JLabel(vue.libelleSemaine(), SwingConstants.CENTER);
             semaine.setFont(Theme.FONT_LABEL.deriveFont(Font.BOLD, 15f));
