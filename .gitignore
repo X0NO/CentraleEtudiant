@@ -4,3 +4,4 @@ target/
 notes_backup.csv
 devoirs_backup.csv
 *.csv.tmp
+evaluations.csv

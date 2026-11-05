@@ -6,7 +6,7 @@ Deux petites applications de bureau (Java Swing) pour la vie étudiante :
 
 | Fichier | Rôle |
 |---|---|
-| `Note.java` | Gestion des notes par matière, avec coefficients, moyennes pondérées, base PostgreSQL et sauvegarde locale CSV |
+| `Note.java` | Notes du BUT1 Info S1 : moyennes par matière, par UE et générale, statut du semestre (calcul dans `Programme.java`) |
 | `Calendar.java` | Agenda hebdomadaire en grille (façon ADE) alimenté par un lien iCal (emploi du temps) |
 
 Les deux partagent le même style visuel (thème sombre). Ce sont deux programmes indépendants, chacun avec son propre `main`.
@@ -133,124 +133,92 @@ Classes à lancer : `com.centrale.Note` et `com.centrale.Calendar`.
 
 ---
 
-## `Note.java` : gestion des notes
+## `Note.java` : notes et moyennes du BUT1 Informatique (S1)
 
 ### Ce que fait l'application
 
-- Un tableau des notes par matière (une colonne par note, affichée sous la forme `15/20 (coef 2)`)
-- Un tableau des moyennes par matière
-- Trois boutons :
-  - **Ajouter Une Note** : matière, note au format `note/quotient` (ex. `15/20`) et coefficient (1 par défaut)
-  - **Supprimer la note sélectionnée** : on clique sur la case d'une note dans le tableau, puis sur le bouton
-  - **Ajouter Une Matière**
+- **Moyenne générale**, statut d'obtention du semestre et les **6 UE** (UE 1.1 à 1.6) avec leur moyenne ; au survol d'une UE, le détail du calcul (matière, moyenne, coefficient, produit).
+- **Ajouter une évaluation** directement en haut de la page : matière ou SAÉ, nom (DS1, TP noté...), note, barème (« sur »), coefficient. `12,5` et `12.5` sont acceptés, on peut aussi taper `15/20` dans le champ note. Entrée = Ajouter.
+- **Ressources** (R1.01 à R1.12) et **SAÉ** (1.01 à 1.06) : clic sur une matière pour voir ses notes, les modifier (crayon) ou les supprimer (croix, avec « Annuler »).
 
-Règles de saisie : la note ne peut pas dépasser le quotient, le coefficient doit être supérieur à 0 (2 chiffres avant et après la virgule au maximum, `2`, `0.5` et `1,5` sont acceptés), et le caractère `;` est interdit dans un nom de matière (c'est le séparateur du CSV).
+Les matières sont celles du programme officiel : plus besoin de les créer.
 
-Au premier lancement, aucune matière n'existe : chacun ajoute les siennes avec **Ajouter Une Matière** avant de saisir des notes.
+### Calcul (identique au [gestionnaire de notes de TomH0999](https://github.com/TomH0999/gestionnaire_de_notes))
 
-### Calcul de la moyenne
+Code dans `Programme.java` :
 
-Moyenne pondérée par matière, sur 20 :
+1. **Moyenne d'une matière** = somme(note ramenée sur 20 × coef de la note) / somme(coefs des notes).
+2. **Moyenne d'une UE** = somme(moyenne de la matière × coef de la matière dans l'UE) / somme(coefs). Les matières sans note sont ignorées (ni au numérateur ni au dénominateur).
+3. **Moyenne générale** = moyenne simple des UE qui ont une moyenne.
+4. **Statut** (quand les 6 UE sont calculées) : non validé si plus de 2 UE sous 10 ou une UE sous 8 ; validé avec rattrapage si 1 ou 2 UE sous 10 ; validé sinon.
 
-```
-moyenne = somme( (note / quotient) × coefficient ) / somme( coefficient ) × 20
-```
+Coefficients des matières dans chaque UE :
 
-Exemple : `10/20 (coef 1)` et `20/20 (coef 3)` donnent `(0,5×1 + 1×3) / 4 × 20 = 17,5`.
+| UE | Coefficients |
+|---|---|
+| UE 1.1 | SAÉ 1.01 : 40 · R1.01 : 42 · R1.02 : 12 · R1.10 : 6 |
+| UE 1.2 | SAÉ 1.02 : 40 · R1.01 : 24 · R1.03 : 3 · R1.04 : 3 · R1.06 : 15 · R1.07 : 15 |
+| UE 1.3 | SAÉ 1.03 : 40 · R1.03 : 21 · R1.04 : 21 · R1.10 : 12 · R1.11 : 6 |
+| UE 1.4 | SAÉ 1.04 : 40 · R1.05 : 36 · R1.06 : 18 · R1.09 : 6 |
+| UE 1.5 | SAÉ 1.05 : 40 · R1.02 : 18 · R1.08 : 27 · R1.11 : 15 |
+| UE 1.6 | SAÉ 1.06 : 40 · R1.02 : 5 · R1.08 : 11 · R1.09 : 11 · R1.10 : 11 · R1.11 : 11 · R1.12 : 11 |
 
-### Double sauvegarde : BDD + CSV
+`ProgrammeTest` vérifie que les résultats sont identiques **au bit près** à ceux de son application, sur ses 17 jeux de test (`src/test/resources/golden-gestionnaire-de-notes.json`, copié de son dépôt) : `mvn test`.
 
-Les notes ont deux témoins : la base PostgreSQL et un fichier local `notes_backup.csv`.
+### Rapidité : la BDD n'est jamais attendue
 
-- À chaque ajout ou suppression (note ou matière), la **BDD et le CSV sont mis à jour en même temps**.
-- Si la **BDD est injoignable**, le CSV sert de témoin : l'affichage, les ajouts et les suppressions continuent de fonctionner à partir de lui.
-- Au **retour de la BDD**, les deux sont comparés et alignés :
-  - rien en attente dans le CSV : le CSV est réécrit à partir de la BDD ;
-  - des changements faits hors-ligne : ils sont d'abord envoyés à la BDD, puis le CSV est réaligné sur elle ;
-  - si l'envoi échoue en cours de route, le CSV n'est **pas** écrasé et le reste attend la prochaine tentative.
-- Si la lecture de la BDD échoue, le CSV existant n'est jamais écrasé.
+Avant, chaque clic tentait 2 ou 3 connexions à la BDD dans le fil de l'interface (3 s chacune quand le Raspberry Pi est injoignable) : l'appli se figeait 5 à 10 s. Maintenant (`Bdd.java`, utilisé par les notes et les devoirs) :
 
-Cette comparaison se fait au démarrage, à chaque rechargement de l'affichage et avant chaque action.
+- chaque action écrit **d'abord dans le fichier local** (instantané) et l'affichage est mis à jour tout de suite ;
+- la synchronisation avec la BDD tourne ensuite **sur un fil à part**, avec une seule connexion et un délai de 2 s ;
+- après un échec, la BDD est considérée hors-ligne pendant 30 s (pas de nouvelle tentative inutile) ;
+- une pastille en haut à droite indique l'état (synchronisé, hors ligne · N en attente, ou enregistré sur cet ordinateur) ; un clic dessus relance la synchronisation.
 
-#### Format de `notes_backup.csv`
+Au retour de la BDD, les changements en attente sont envoyés puis le fichier est réaligné sur la BDD ; un changement fait pendant la synchronisation n'est jamais perdu (il reste en attente pour la suivante).
+
+#### Format de `evaluations.csv`
 
 ```csv
-type;matiere;valeur;quotient;coefficient;statut
-M;Maths;0;0;1;SYNC
-N;Maths;15;20;2;SYNC
-N;Maths;8;10;0.5;ADD
-N;Maths;12;20;1;DEL
+uid;code;note;bareme;coef;cree_le;statut;nom
+3f1c...;R1.01;14.5;20.0;1.0;1788220800000;SYNC;DS1
 ```
 
-- `type` : `M` (matière) ou `N` (note)
-- `statut` :
-  - `SYNC` : présent dans la BDD et dans le CSV
-  - `ADD` : ajouté hors-ligne, pas encore envoyé à la BDD
-  - `DEL` : supprimé hors-ligne, pas encore supprimé de la BDD
-- Les lignes de matière (`M`) n'utilisent pas les colonnes valeur, quotient et coefficient (mises à `0;0;1`).
-- L'ancien format à 5 colonnes (sans coefficient) est relu sans problème, avec un coefficient de 1.
-- Le fichier est écrit de façon atomique (fichier temporaire puis remplacement).
+- `statut` : `SYNC` (identique dans la BDD), `ADD` / `MOD` (à envoyer), `DEL` (à supprimer de la BDD).
+- `nom` en dernier (peut contenir des `;`). Écriture atomique (fichier temporaire puis remplacement).
 
-### Organisation du code (classes imbriquées dans `Note`)
+#### Conversion de l'ancienne version
 
-| Classe | Rôle |
-|---|---|
-| `Theme` | Couleurs et polices du thème sombre |
-| `Database` | Connexion JDBC, test de disponibilité (`ping`), création des tables, synchronisation |
-| `MatiereDAO` | Requêtes sur la table `matieres` |
-| `NoteDAO` | Requêtes sur la table `notes` (insertion, suppression) |
-| `CsvMirror` | Lecture/écriture du CSV et réconciliation avec la BDD |
-
-Le délai de connexion est limité à 3 secondes pour que l'application ne se fige pas quand le Raspberry Pi ne répond pas.
+Au premier lancement, les notes de l'ancien `notes_backup.csv` (matières libres) sont converties : chaque matière est rattachée à son code (`Init_Dev` → R1.01, `Dev_Web` → R1.02, `Intro_Syst` → R1.04, `Intro_BD` → R1.05, `Maths` → R1.06, `Gestion` → R1.08, `Anglais` → R1.10, `Commu` → R1.11, `PPP` → R1.12...). L'ancien fichier n'est pas modifié. Une matière impossible à rattacher est signalée dans la fenêtre.
 
 ---
 
 ## Architecture de la base de données
 
-PostgreSQL, deux tables créées automatiquement au lancement si elles n'existent pas :
-
-```mermaid
-erDiagram
-    matieres ||--o{ notes : "possède"
-    matieres {
-        SERIAL id PK
-        VARCHAR100 nom "UNIQUE, NOT NULL"
-        NUMERIC42 coefficient "NOT NULL, défaut 1"
-    }
-    notes {
-        SERIAL id PK
-        INTEGER matiere_id FK "NOT NULL"
-        INTEGER valeur "NOT NULL"
-        INTEGER quotient "NOT NULL"
-        NUMERIC42 coefficient "NOT NULL, défaut 1"
-        TIMESTAMP date_creation "défaut NOW()"
-    }
-```
+PostgreSQL, tables créées automatiquement si elles n'existent pas :
 
 ```sql
-CREATE TABLE IF NOT EXISTS matieres (
-    id SERIAL PRIMARY KEY,
-    nom VARCHAR(100) NOT NULL UNIQUE,
-    coefficient NUMERIC(4,2) NOT NULL DEFAULT 1
+CREATE TABLE IF NOT EXISTS evaluations (
+    uid VARCHAR(36) PRIMARY KEY,
+    code VARCHAR(20) NOT NULL,          -- R1.01 ... SAE 1.06
+    nom VARCHAR(200) NOT NULL,
+    note DOUBLE PRECISION NOT NULL,
+    bareme DOUBLE PRECISION NOT NULL,
+    coef DOUBLE PRECISION NOT NULL,
+    cree_le BIGINT NOT NULL             -- ordre du calcul (millisecondes)
 );
 
-CREATE TABLE IF NOT EXISTS notes (
+CREATE TABLE IF NOT EXISTS devoirs (
     id SERIAL PRIMARY KEY,
-    matiere_id INTEGER NOT NULL REFERENCES matieres(id) ON DELETE CASCADE,
-    valeur INTEGER NOT NULL,
-    quotient INTEGER NOT NULL,
-    coefficient NUMERIC(4,2) NOT NULL DEFAULT 1,
+    uid VARCHAR(36) NOT NULL UNIQUE,
+    matiere VARCHAR(100) NOT NULL,
+    date_rendu DATE NOT NULL,
+    fait BOOLEAN NOT NULL DEFAULT FALSE,
+    description TEXT NOT NULL,
     date_creation TIMESTAMP DEFAULT NOW()
 );
-
--- Base créée avant l'ajout des coefficients : la colonne est ajoutée automatiquement
-ALTER TABLE notes ADD COLUMN IF NOT EXISTS coefficient NUMERIC(4,2) NOT NULL DEFAULT 1;
 ```
 
-- Supprimer une matière supprime aussi ses notes (`ON DELETE CASCADE`).
-- Les anciennes notes créées avant les coefficients valent automatiquement 1.
-- Supprimer une note retire la plus récente qui correspond exactement à (matière, valeur, quotient, coefficient).
-- La colonne `matieres.coefficient` existe mais n'est pas utilisée dans le calcul actuel : la moyenne d'une matière ne dépend que des coefficients des notes.
+Les anciennes tables `matieres` et `notes` (version avec matières libres) ne sont plus utilisées ni modifiées.
 
 ---
 
@@ -281,7 +249,7 @@ Si le lien est injoignable, une fenêtre d'erreur s'affiche et l'agenda s'ouvre 
 
 - Les événements récurrents iCal (`RRULE`) ne sont pas développés : seuls les événements listés tels quels apparaissent.
 - L'agenda n'est chargé qu'au lancement (pas de rafraîchissement automatique du lien iCal).
-- Pas de suppression de matière dans l'interface, et pas de modification d'une note : pour changer une note ou son coefficient, il faut la supprimer puis la ré-ajouter.
+- Seul le semestre 1 du BUT1 Informatique est connu (programme et coefficients dans `Programme.java`).
 - La logique CSV et le calcul des moyennes ont été testés hors-ligne ; la synchronisation avec la vraie base PostgreSQL est à valider en conditions réelles.
 
 ## À ne pas commiter

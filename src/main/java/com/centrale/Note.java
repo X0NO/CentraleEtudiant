@@ -1,141 +1,162 @@
 package com.centrale;
 
 import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Cursor;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.GridLayout;
 import java.awt.Insets;
+import java.awt.Rectangle;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Set;
+import java.util.UUID;
+import java.util.prefs.Preferences;
+
+import javax.swing.BorderFactory;
+import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
+import javax.swing.JComponent;
+import javax.swing.JDialog;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
-import javax.swing.JOptionPane;
+import javax.swing.JList;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
-import javax.swing.JTable;
 import javax.swing.JTextField;
+import javax.swing.Scrollable;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
-import javax.swing.table.DefaultTableModel;
-import javax.swing.text.AttributeSet;
-import javax.swing.text.BadLocationException;
-import javax.swing.text.DocumentFilter;
-import javax.swing.text.PlainDocument;
 
+import com.formdev.flatlaf.FlatClientProperties;
+
+/**
+ * Notes et moyennes du BUT1 Informatique (semestre 1).
+ *
+ * - Calcul identique au gestionnaire de notes de TomH0999 (voir {@link Programme}) :
+ *   matières R1.01 à R1.12 et SAÉ 1.01 à 1.06, moyennes d'UE coefficientées, moyenne générale
+ *   = moyenne des 6 UE, statut d'obtention du semestre.
+ * - Chaque évaluation : nom (DS1, TP noté...), note, barème (sur 20, sur 30...), coefficient.
+ * - Enregistrement instantané dans evaluations.csv ; la BDD (facultative) est synchronisée
+ *   en arrière-plan, sans jamais faire attendre l'interface (voir {@link Bdd}).
+ */
 public class Note {
 
     // =====================================================================
-    // CONNEXION BASE DE DONNÉES
+    // MODÈLE
     // =====================================================================
-    // Base facultative : adresse et identifiants dans les Paramètres (voir Config).
-    // Sans base configurée, tout reste dans le fichier CSV local.
+    static final class Evaluation implements Programme.Evaluation {
+        final String uid;
+        String code;
+        String nom;
+        double note;
+        double bareme;
+        double coef;
+        final long creeLe;
+        String statut;
 
-    static int[] columnNote = {2};
-    static JTable tableNote;
-    static JTable tableMoyenne;
-    static JLabel labelGenerale;
-    static String[] nomsMatieres = new String[0];
-
-    // =====================================================================
-    // MIROIR CSV LOCAL (2e TÉMOIN DES NOTES)
-    //
-    // Fichier notes_backup.csv, une ligne par matière ou par note :
-    //     type;matiere;valeur;quotient;coefficient;statut
-    //   type   : M (matière) ou N (note)
-    //   coefficient : ligne M = poids de la matière dans la moyenne générale
-    //                 ligne N = poids de la note dans la moyenne de la matière (1 par défaut)
-    //   statut : SYNC = présent dans la BDD ET dans le fichier
-    //            ADD  = ajouté hors-ligne, pas encore envoyé à la BDD
-    //            DEL  = supprimé hors-ligne, pas encore supprimé de la BDD
-    //            MOD  = coefficient de matière changé hors-ligne, pas encore envoyé à la BDD
-    //
-    // Règles :
-    //  - chaque ajout/suppression met à jour la BDD ET le CSV en même temps ;
-    //  - BDD injoignable : le CSV sert de témoin (affichage + modifications) ;
-    //  - retour en ligne : s'il n'y a rien d'en attente dans le CSV, il est
-    //    réécrit à partir de la BDD ; sinon les changements en attente sont
-    //    appliqués à la BDD, puis le CSV est réaligné sur la BDD.
-    // =====================================================================
-    static final class CsvMirror {
-        static final Path FILE = Config.fichier("notes_backup.csv");
-        static final String HEADER = "type;matiere;valeur;quotient;coefficient;statut";
-        static final String SYNC = "SYNC";
-        static final String ADD = "ADD";
-        static final String DEL = "DEL";
-        static final String MOD = "MOD";
-
-        static final class Entry {
-            final String type;
-            final String matiere;
-            final int valeur;
-            final int quotient;
-            final double coefficient;
-            String statut;
-
-            Entry(String type, String matiere, int valeur, int quotient, double coefficient, String statut) {
-                this.type = type;
-                this.matiere = matiere;
-                this.valeur = valeur;
-                this.quotient = quotient;
-                this.coefficient = coefficient;
-                this.statut = statut;
-            }
-
-            boolean estNote() {
-                return type.equals("N");
-            }
-
-            /** coef == null : le coefficient est ignoré dans la recherche. */
-            boolean memeNote(String m, int v, int q, Double coef) {
-                return estNote() && matiere.equals(m) && valeur == v && quotient == q
-                        && (coef == null || Math.abs(coefficient - coef) < 0.001);
-            }
-
-            String toLine() {
-                return type + ";" + matiere + ";" + valeur + ";" + quotient + ";"
-                        + formatCoef(coefficient) + ";" + statut;
-            }
+        Evaluation(String uid, String code, String nom, double note, double bareme, double coef, long creeLe, String statut) {
+            this.uid = uid;
+            this.code = code;
+            this.nom = nom;
+            this.note = note;
+            this.bareme = bareme;
+            this.coef = coef;
+            this.creeLe = creeLe;
+            this.statut = statut;
         }
 
-        /** Lit le CSV. Si la lecture échoue, on lève une exception plutôt que d'écraser le fichier ensuite. */
-        static synchronized List<Entry> lire() {
-            List<Entry> res = new ArrayList<>();
-            Path p = FILE;
-            if (!Files.exists(p)) return res;
+        @Override public String code() { return code; }
+        @Override public double note() { return note; }
+        @Override public double bareme() { return bareme; }
+        @Override public double coef() { return coef; }
+
+        double surVingt() {
+            return note / bareme * 20;
+        }
+
+        Evaluation copie() {
+            return new Evaluation(uid, code, nom, note, bareme, coef, creeLe, statut);
+        }
+
+        String toLine() {
+            return uid + ";" + code + ";" + Double.toString(note) + ";" + Double.toString(bareme) + ";"
+                    + Double.toString(coef) + ";" + creeLe + ";" + statut + ";" + Stockage.coder(nom);
+        }
+    }
+
+    /** Ordre du calcul (comme l'original) : date de création, puis identifiant. */
+    static final Comparator<Evaluation> ORDRE =
+            Comparator.comparingLong((Evaluation e) -> e.creeLe).thenComparing(e -> e.uid);
+
+    // =====================================================================
+    // STOCKAGE LOCAL : evaluations.csv
+    //
+    //     uid;code;note;bareme;coef;cree_le;statut;nom
+    //   statut : SYNC = identique dans la BDD
+    //            ADD  = créée ou modifiée ici, pas encore envoyée à la BDD
+    //            MOD  = modifiée ici, pas encore envoyée à la BDD
+    //            DEL  = supprimée ici, pas encore supprimée de la BDD
+    //   nom en dernier (peut contenir des ';').
+    //
+    // L'interface ne lit et n'écrit QUE ce fichier (instantané). La BDD est mise à jour ensuite,
+    // en arrière-plan, par Database.synchroniser().
+    // =====================================================================
+    static final class Stockage {
+        static final Path FILE = Config.fichier("evaluations.csv");
+        /** Fichier de l'ancienne version (matières libres) : converti une fois, puis laissé tel quel. */
+        static final Path ANCIEN = Config.fichier("notes_backup.csv");
+        static final String HEADER = "uid;code;note;bareme;coef;cree_le;statut;nom";
+        static final String SYNC = "SYNC";
+        static final String ADD = "ADD";
+        static final String MOD = "MOD";
+        static final String DEL = "DEL";
+
+        /** Matières de l'ancienne version qui n'ont pas pu être rattachées au programme (affiché une fois). */
+        static volatile List<String> nonMigrees = List.of();
+
+        static synchronized List<Evaluation> lire() {
+            if (!Files.exists(FILE)) migrerAncienneVersion();
+            List<Evaluation> res = new ArrayList<>();
+            if (!Files.exists(FILE)) return res;
             try {
-                for (String line : Files.readAllLines(p, StandardCharsets.UTF_8)) {
-                    String[] parts = line.split(";");
-                    if (parts[0].equals("type") || (parts.length != 5 && parts.length != 6)) continue;
+                for (String line : Files.readAllLines(FILE, StandardCharsets.UTF_8)) {
+                    if (line.equals(HEADER) || line.isBlank()) continue;
+                    String[] p = line.split(";", 8);
+                    if (p.length != 8) continue;
                     try {
-                        // 5 colonnes = ancien format (sans coefficient) -> coefficient 1
-                        boolean ancien = (parts.length == 5);
-                        double coef = ancien ? 1.0 : Double.parseDouble(parts[4]);
-                        String statut = ancien ? parts[4] : parts[5];
-                        res.add(new Entry(parts[0], parts[1],
-                                Integer.parseInt(parts[2]), Integer.parseInt(parts[3]), coef, statut));
+                        res.add(new Evaluation(p[0], p[1], decoder(p[7]), Double.parseDouble(p[2]),
+                                Double.parseDouble(p[3]), Double.parseDouble(p[4]), Long.parseLong(p[5]), p[6]));
                     } catch (NumberFormatException ignored) {
                         // ligne illisible : ignorée
                     }
@@ -146,11 +167,11 @@ public class Note {
             return res;
         }
 
-        /** Écriture atomique (fichier temporaire puis remplacement) pour ne jamais laisser un CSV à moitié écrit. */
-        static synchronized void ecrire(List<Entry> entries) {
+        /** Écriture atomique (fichier temporaire puis remplacement). */
+        static synchronized void ecrire(List<Evaluation> l) {
             List<String> lignes = new ArrayList<>();
             lignes.add(HEADER);
-            for (Entry e : entries) lignes.add(e.toLine());
+            for (Evaluation e : l) lignes.add(e.toLine());
             try {
                 Path tmp = FILE.resolveSibling(FILE.getFileName() + ".tmp");
                 Files.write(tmp, lignes, StandardCharsets.UTF_8);
@@ -160,1114 +181,1096 @@ public class Note {
             }
         }
 
-        // ---------- Mises à jour appelées en même temps que la BDD ----------
-
-        static synchronized void ajouterMatiere(String nom, double coefficient, boolean dbOk) {
-            List<Entry> l = lire();
-            l.add(new Entry("M", nom, 0, 0, coefficient, dbOk ? SYNC : ADD));
-            ecrire(l);
+        static String coder(String s) {
+            return s.replace("\\", "\\\\").replace("\r", "").replace("\n", "\\n");
         }
 
-        /**
-         * Renomme une matière (ses notes suivent) et change son coefficient.
-         * Hors-ligne, un coefficient déjà synchronisé passe en MOD (envoyé à la BDD plus tard).
-         */
-        static synchronized void modifierMatiere(String ancienNom, String nouveauNom, double coefficient, boolean dbOk) {
-            List<Entry> l = lire();
-            for (int i = 0; i < l.size(); i++) {
-                Entry e = l.get(i);
-                if (!e.matiere.equals(ancienNom)) continue;
-                if (e.type.equals("M")) {
-                    boolean coefChange = Math.abs(e.coefficient - coefficient) >= 0.001;
-                    String statut = (!dbOk && coefChange && e.statut.equals(SYNC)) ? MOD : e.statut;
-                    l.set(i, new Entry("M", nouveauNom, 0, 0, coefficient, statut));
+        static String decoder(String s) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c == '\\' && i + 1 < s.length()) {
+                    char suivant = s.charAt(++i);
+                    sb.append(suivant == 'n' ? '\n' : suivant);
                 } else {
-                    l.set(i, new Entry(e.type, nouveauNom, e.valeur, e.quotient, e.coefficient, e.statut));
+                    sb.append(c);
                 }
             }
+            return sb.toString();
+        }
+
+        // ---------- lecture pour l'affichage ----------
+
+        /** Évaluations visibles (pas supprimées), dans l'ordre du calcul. */
+        static synchronized List<Evaluation> visibles() {
+            List<Evaluation> res = new ArrayList<>();
+            for (Evaluation e : lire()) if (!e.statut.equals(DEL)) res.add(e);
+            res.sort(ORDRE);
+            return res;
+        }
+
+        static synchronized int enAttente() {
+            int n = 0;
+            for (Evaluation e : lire()) if (!e.statut.equals(SYNC)) n++;
+            return n;
+        }
+
+        // ---------- modifications (instantanées) ----------
+
+        static synchronized void ajouter(Evaluation e) {
+            List<Evaluation> l = lire();
+            e.statut = ADD;
+            l.add(e);
             ecrire(l);
         }
 
-        /** Retire la matière et toutes ses notes du fichier. */
-        static synchronized void supprimerMatiere(String nom) {
-            List<Entry> l = lire();
-            l.removeIf(e -> e.matiere.equals(nom));
-            ecrire(l);
+        static synchronized void modifier(Evaluation nouvelle) {
+            List<Evaluation> l = lire();
+            for (Evaluation e : l) {
+                if (e.uid.equals(nouvelle.uid) && !e.statut.equals(DEL)) {
+                    e.code = nouvelle.code;
+                    e.nom = nouvelle.nom;
+                    e.note = nouvelle.note;
+                    e.bareme = nouvelle.bareme;
+                    e.coef = nouvelle.coef;
+                    if (!e.statut.equals(ADD)) e.statut = MOD;
+                    ecrire(l);
+                    return;
+                }
+            }
         }
 
-        static synchronized void ajouterNote(String matiere, int valeur, int quotient, double coefficient, boolean dbOk) {
-            List<Entry> l = lire();
-            l.add(new Entry("N", matiere, valeur, quotient, coefficient, dbOk ? SYNC : ADD));
-            ecrire(l);
-        }
-
-        /**
-         * Supprime la note la plus récente correspondante (comme la BDD).
-         * Hors-ligne, une note déjà synchronisée est marquée DEL (à supprimer de la BDD plus tard),
-         * une note ajoutée hors-ligne (ADD) est simplement retirée du fichier.
-         * @param coefficient null = le coefficient est ignoré dans la recherche
-         * @return true si la note existait dans le fichier
-         */
-        static synchronized boolean supprimerNote(String matiere, int valeur, int quotient, Double coefficient, boolean dbOk) {
-            List<Entry> l = lire();
-            for (int i = l.size() - 1; i >= 0; i--) {
-                Entry e = l.get(i);
-                if (e.memeNote(matiere, valeur, quotient, coefficient) && !e.statut.equals(DEL)) {
-                    if (dbOk || e.statut.equals(ADD)) l.remove(i);
+        /** @return une copie de l'évaluation telle qu'elle était (pour « Annuler »), null si absente. */
+        static synchronized Evaluation supprimer(String uid) {
+            List<Evaluation> l = lire();
+            for (int i = 0; i < l.size(); i++) {
+                Evaluation e = l.get(i);
+                if (e.uid.equals(uid) && !e.statut.equals(DEL)) {
+                    Evaluation avant = e.copie();
+                    if (e.statut.equals(ADD)) l.remove(i); // jamais envoyée : on l'oublie simplement
                     else e.statut = DEL;
                     ecrire(l);
-                    return true;
+                    return avant;
                 }
-            }
-            return false;
-        }
-
-        // ---------- Lecture (utilisée pour l'affichage) ----------
-
-        static synchronized boolean matiereExiste(String nom) {
-            for (Entry e : lire()) {
-                if (e.type.equals("M") && e.matiere.equalsIgnoreCase(nom)) return true;
-            }
-            return false;
-        }
-
-        static synchronized List<String> listerMatieres() {
-            List<String> noms = new ArrayList<>();
-            for (Entry e : lire()) {
-                if (e.type.equals("M")) noms.add(e.matiere);
-            }
-            return noms;
-        }
-
-        /** Coefficient de chaque matière, dans l'ordre d'ajout (1 si inconnu). */
-        static synchronized Map<String, Double> coefficientsMatieres() {
-            Map<String, Double> coefs = new LinkedHashMap<>();
-            for (Entry e : lire()) {
-                if (e.type.equals("M")) coefs.put(e.matiere, e.coefficient > 0 ? e.coefficient : 1.0);
-            }
-            return coefs;
-        }
-
-        static synchronized List<String> listerNotes(String matiere) {
-            List<String> notes = new ArrayList<>();
-            for (Entry e : lire()) {
-                if (e.estNote() && e.matiere.equals(matiere) && !e.statut.equals(DEL)) {
-                    notes.add(e.valeur + "/" + e.quotient + " (coef " + formatCoef(e.coefficient) + ")");
-                }
-            }
-            return notes;
-        }
-
-        // ---------- Comparaison / synchronisation au retour en ligne ----------
-
-        static synchronized void reconcilier() {
-            List<Entry> l = lire();
-
-            boolean enAttente = false;
-            for (Entry e : l) {
-                if (!e.statut.equals(SYNC)) { enAttente = true; break; }
-            }
-
-            if (enAttente) {
-                boolean toutOk = true;
-
-                // 1) les matières créées ou modifiées hors-ligne d'abord
-                for (Entry e : l) {
-                    if (!e.type.equals("M") || e.statut.equals(SYNC)) continue;
-                    boolean ok;
-                    if (MatiereDAO.trouverIdParNom(e.matiere) == null) {
-                        ok = MatiereDAO.inserer(e.matiere, e.coefficient) != -1;
-                    } else {
-                        ok = MatiereDAO.modifier(e.matiere, e.matiere, e.coefficient);
-                    }
-                    if (ok) e.statut = SYNC; else toutOk = false;
-                }
-
-                // 2) puis les notes ajoutées / supprimées hors-ligne
-                Iterator<Entry> it = l.iterator();
-                while (it.hasNext()) {
-                    Entry e = it.next();
-                    if (!e.estNote() || e.statut.equals(SYNC)) continue;
-
-                    Integer id = MatiereDAO.trouverIdParNom(e.matiere);
-                    if (id == null) { toutOk = false; continue; }
-
-                    if (e.statut.equals(ADD)) {
-                        if (NoteDAO.inserer(id, e.valeur, e.quotient, e.coefficient)) e.statut = SYNC;
-                        else toutOk = false;
-                    } else if (e.statut.equals(DEL)) {
-                        if (NoteDAO.supprimer(id, e.valeur, e.quotient, e.coefficient) >= 0) it.remove();
-                        else toutOk = false;
-                    }
-                }
-
-                // On enregistre ce qui a pu être envoyé ; le reste reste en attente
-                ecrire(l);
-                if (!toutOk) return; // on ne touche pas au CSV tant que la BDD n'est pas à jour
-            }
-
-            // Plus rien en attente : le CSV est réaligné sur la BDD
-            reconstruireDepuisBD();
-        }
-
-        /** Réécrit le CSV à partir de la BDD. Si la lecture BDD échoue, le CSV existant n'est pas touché. */
-        static synchronized void reconstruireDepuisBD() {
-            String sql = "SELECT m.nom, m.coefficient AS coef_matiere, n.valeur, n.quotient, n.coefficient FROM matieres m "
-                       + "LEFT JOIN notes n ON n.matiere_id = m.id ORDER BY m.id, n.id";
-            List<Entry> l = new ArrayList<>();
-            String derniere = null;
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql);
-                 ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    String nom = rs.getString("nom");
-                    if (!nom.equals(derniere)) {
-                        l.add(new Entry("M", nom, 0, 0, rs.getDouble("coef_matiere"), SYNC));
-                        derniere = nom;
-                    }
-                    int valeur = rs.getInt("valeur");
-                    if (!rs.wasNull()) {
-                        l.add(new Entry("N", nom, valeur, rs.getInt("quotient"), rs.getDouble("coefficient"), SYNC));
-                    }
-                }
-            } catch (SQLException e) {
-                System.err.println("Lecture BDD impossible, CSV conservé tel quel : " + e.getMessage());
-                return;
-            }
-            ecrire(l);
-        }
-    }
-
-    // =====================================================================
-    // ACCÈS BASE DE DONNÉES
-    // =====================================================================
-    static final class Database {
-
-        /** true une fois les tables (et la colonne coefficient) vérifiées/créées. */
-        static boolean schemaPret = false;
-
-        static Connection getConnection() throws SQLException {
-            if (!Config.bddConfiguree()) throw new SQLException("Aucune base de données configurée (mode local)");
-            return DriverManager.getConnection(Config.get(Config.DB_URL), Config.get(Config.DB_USER), Config.get(Config.DB_PASSWORD));
-        }
-
-        /** true si la BDD répond. */
-        static boolean ping() {
-            try (Connection conn = getConnection()) {
-                return true;
-            } catch (SQLException e) {
-                return false;
-            }
-        }
-
-        /** Si la BDD est joignable : compare BDD et CSV, et aligne l'un sur l'autre (voir CsvMirror). */
-        static void synchroniser() {
-            if (!ping()) return;
-            if (!schemaPret) creerTables(); // appli lancée hors-ligne : on prépare la BDD dès son retour
-            try {
-                CsvMirror.reconcilier();
-            } catch (Exception e) {
-                System.err.println("Synchronisation BDD/CSV impossible : " + e.getMessage());
-            }
-        }
-
-        static boolean connecter() {
-            try (Connection conn = getConnection()) {
-                System.out.println("Connexion à la base de données réussie !");
-                return true;
-            } catch (SQLException e) {
-                System.err.println("Base de données injoignable, mode local : " + e.getMessage());
-                return false;
-            }
-        }
-
-        static void creerTables() {
-            String sqlMatieres = "CREATE TABLE IF NOT EXISTS matieres (" +
-                    "id SERIAL PRIMARY KEY," +
-                    "nom VARCHAR(100) NOT NULL UNIQUE," +
-                    "coefficient NUMERIC(4,2) NOT NULL DEFAULT 1" +
-                    ")";
-
-            String sqlNotes = "CREATE TABLE IF NOT EXISTS notes (" +
-                    "id SERIAL PRIMARY KEY," +
-                    "matiere_id INTEGER NOT NULL REFERENCES matieres(id) ON DELETE CASCADE," +
-                    "valeur INTEGER NOT NULL," +
-                    "quotient INTEGER NOT NULL," +
-                    "coefficient NUMERIC(4,2) NOT NULL DEFAULT 1," +
-                    "date_creation TIMESTAMP DEFAULT NOW()" +
-                    ")";
-
-            try (Connection conn = getConnection();
-                 Statement stmt = conn.createStatement()) {
-                stmt.execute(sqlMatieres);
-                stmt.execute(sqlNotes);
-                // Base déjà existante sans la colonne : on l'ajoute (les anciennes notes valent coefficient 1)
-                stmt.execute("ALTER TABLE notes ADD COLUMN IF NOT EXISTS coefficient NUMERIC(4,2) NOT NULL DEFAULT 1");
-                stmt.execute("ALTER TABLE matieres ADD COLUMN IF NOT EXISTS coefficient NUMERIC(4,2) NOT NULL DEFAULT 1");
-                System.out.println("Tables 'matieres' et 'notes' prêtes.");
-                schemaPret = true;
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    // =====================================================================
-    // DAO MATIÈRES
-    // =====================================================================
-    static final class MatiereDAO {
-
-        static Integer trouverIdParNom(String nom) {
-            String sql = "SELECT id FROM matieres WHERE nom = ?";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setString(1, nom);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    if (rs.next()) return rs.getInt("id");
-                }
-            } catch (SQLException e) {
-                e.printStackTrace();
             }
             return null;
         }
 
-        static int inserer(String nom, double coefficient) {
-            String sql = "INSERT INTO matieres (nom, coefficient) VALUES (?, ?) RETURNING id";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setString(1, nom);
-                stmt.setBigDecimal(2, toDecimal(coefficient));
-                try (ResultSet rs = stmt.executeQuery()) {
-                    if (rs.next()) return rs.getInt("id");
+        /** Annule une suppression. */
+        static synchronized void restaurer(Evaluation avant) {
+            List<Evaluation> l = lire();
+            for (Evaluation e : l) {
+                if (e.uid.equals(avant.uid)) {
+                    e.statut = avant.statut.equals(ADD) ? ADD : MOD; // MOD = renvoyée à la BDD (sans risque)
+                    ecrire(l);
+                    return;
                 }
-            } catch (SQLException e) {
-                e.printStackTrace();
             }
-            return -1;
+            Evaluation r = avant.copie();
+            r.statut = ADD;
+            l.add(r);
+            ecrire(l);
         }
 
-        /** Renomme une matière et change son coefficient. false si la BDD a refusé (nom déjà pris, injoignable...). */
-        static boolean modifier(String ancienNom, String nouveauNom, double coefficient) {
-            String sql = "UPDATE matieres SET nom = ?, coefficient = ? WHERE nom = ?";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setString(1, nouveauNom);
-                stmt.setBigDecimal(2, toDecimal(coefficient));
-                stmt.setString(3, ancienNom);
-                return stmt.executeUpdate() > 0;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return false;
-            }
-        }
+        // ---------- synchronisation ----------
 
-        /** Supprime la matière et ses notes (ON DELETE CASCADE). */
-        static boolean supprimer(String nom) {
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement("DELETE FROM matieres WHERE nom = ?")) {
-                stmt.setString(1, nom);
-                stmt.executeUpdate();
-                return true;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return false;
-            }
-        }
-
-        static List<String> listerNoms() {
-            List<String> noms = new ArrayList<>();
-            String sql = "SELECT nom FROM matieres ORDER BY id";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql);
-                 ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) noms.add(rs.getString("nom"));
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-            return noms;
-        }
-    }
-
-    // =====================================================================
-    // DAO NOTES (AVEC SUPPRESSION ET INSERTION)
-    // =====================================================================
-    static final class NoteDAO {
-
-        static boolean inserer(int matiereId, int valeur, int quotient, double coefficient) {
-            String sql = "INSERT INTO notes (matiere_id, valeur, quotient, coefficient) VALUES (?, ?, ?, ?)";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setInt(1, matiereId);
-                stmt.setInt(2, valeur);
-                stmt.setInt(3, quotient);
-                stmt.setBigDecimal(4, toDecimal(coefficient));
-                stmt.executeUpdate();
-                return true;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return false;
-            }
+        static synchronized List<Evaluation> copiesEnAttente() {
+            List<Evaluation> res = new ArrayList<>();
+            for (Evaluation e : lire()) if (!e.statut.equals(SYNC)) res.add(e.copie());
+            return res;
         }
 
         /**
-         * Supprime la note la plus récente correspondant aux critères (coefficient null = ignoré).
-         * @return 1 = supprimée, 0 = note introuvable en BDD, -1 = erreur (BDD injoignable)
+         * Après un aller-retour avec la BDD : le fichier devient le contenu de la BDD, plus les
+         * changements locaux qui n'y sont pas encore (échec d'envoi, ou faits pendant la synchro).
+         * @param envoyees uid -> ligne envoyée avec succès
+         * @return true s'il reste des changements locaux à envoyer
          */
-        static int supprimer(int matiereId, int valeur, int quotient, Double coefficient) {
-            String sql = "DELETE FROM notes WHERE id IN (" +
-                         "  SELECT id FROM notes WHERE matiere_id = ? AND valeur = ? AND quotient = ? " +
-                         (coefficient != null ? "AND coefficient = ? " : "") +
-                         "  ORDER BY id DESC LIMIT 1" +
-                         ")";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setInt(1, matiereId);
-                stmt.setInt(2, valeur);
-                stmt.setInt(3, quotient);
-                if (coefficient != null) stmt.setBigDecimal(4, toDecimal(coefficient));
-                return stmt.executeUpdate() > 0 ? 1 : 0;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return -1;
+        static synchronized boolean fusionner(List<Evaluation> distantes, Map<String, String> envoyees) {
+            Map<String, Evaluation> res = new LinkedHashMap<>();
+            for (Evaluation d : distantes) res.put(d.uid, d);
+            boolean reste = false;
+            for (Evaluation l : lire()) {
+                String envoyee = envoyees.get(l.uid);
+                boolean changeePendant = envoyee != null && !envoyee.equals(l.toLine());
+                if (l.statut.equals(SYNC) && !changeePendant) continue; // la BDD fait foi
+                if (envoyee != null && !changeePendant) continue;       // envoyée telle quelle : déjà dans la BDD
+                if (l.statut.equals(SYNC)) l.statut = MOD;               // ex : suppression annulée pendant l'envoi
+                res.put(l.uid, l);
+                reste = true;
             }
+            List<Evaluation> l = new ArrayList<>(res.values());
+            l.sort(ORDRE);
+            ecrire(l);
+            return reste;
         }
 
-        static List<String> listerPourMatiere(int matiereId) {
-            List<String> resultats = new ArrayList<>();
-            String sql = "SELECT valeur, quotient FROM notes WHERE matiere_id = ? ORDER BY id";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setInt(1, matiereId);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        resultats.add(rs.getInt("valeur") + "/" + rs.getInt("quotient"));
-                    }
+        // ---------- conversion de l'ancienne version (matières libres) ----------
+
+        /**
+         * notes_backup.csv (type;matiere;valeur;quotient;coefficient;statut) -> evaluations.csv.
+         * Les matières sont rattachées aux codes du programme (« Init_Dev » -> R1.01...).
+         * Identifiants calculés à partir du contenu : deux ordinateurs qui convertissent
+         * le même fichier obtiennent les mêmes, donc pas de doublon dans la BDD.
+         */
+        static void migrerAncienneVersion() {
+            if (!Files.exists(ANCIEN)) return;
+            List<String> lignes;
+            try {
+                lignes = Files.readAllLines(ANCIEN, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                return;
+            }
+            List<Evaluation> res = new ArrayList<>();
+            Set<String> inconnues = new LinkedHashSet<>();
+            Map<String, Integer> numero = new HashMap<>();
+            long base = 1_788_220_800_000L; // 1er septembre 2026 : garde l'ordre de saisie
+            int i = 0;
+            for (String ligne : lignes) {
+                String[] p = ligne.split(";");
+                if (p.length < 5 || !p[0].equals("N")) continue;
+                String statut = p[p.length - 1];
+                if (statut.equals("DEL")) continue;
+                try {
+                    double valeur = Double.parseDouble(p[2]);
+                    double quotient = Double.parseDouble(p[3]);
+                    double coef = (p.length == 6) ? Double.parseDouble(p[4]) : 1.0;
+                    if (quotient <= 0) continue;
+                    String code = Programme.codePourAncienNom(p[1]);
+                    if (code == null) { inconnues.add(p[1]); continue; }
+                    int n = numero.merge(code, 1, Integer::sum);
+                    String uid = UUID.nameUUIDFromBytes(("ancienne-note:" + i + ":" + ligne).getBytes(StandardCharsets.UTF_8)).toString();
+                    res.add(new Evaluation(uid, code, "Note " + n, valeur, quotient, coef, base + i * 1000L, ADD));
+                    i++;
+                } catch (NumberFormatException ignored) {
+                    // ligne illisible
                 }
-            } catch (SQLException e) {
-                e.printStackTrace();
             }
-            return resultats;
+            nonMigrees = List.copyOf(inconnues);
+            ecrire(res);
+            System.out.println(res.size() + " note(s) de l'ancienne version converties vers " + FILE
+                    + (inconnues.isEmpty() ? "" : " ; non rattachées : " + inconnues));
         }
     }
 
     // =====================================================================
-    // UTILITAIRES & THEME
+    // BASE DE DONNÉES (facultative) : table « evaluations »
+    // Une seule connexion par synchronisation, toujours hors de l'interface.
     // =====================================================================
-    static JButton themedButton(String text) {
-        return Theme.bouton(text);
-    }
+    static final class Database {
 
-    static class NoteFilter extends DocumentFilter {
-        @Override
-        public void insertString(FilterBypass fb, int offset, String string, AttributeSet attr) throws BadLocationException {
-            replace(fb, offset, 0, string, attr);
+        static volatile boolean schemaPret = false;
+
+        static void creerTables(Connection c) throws SQLException {
+            try (Statement st = c.createStatement()) {
+                st.execute("CREATE TABLE IF NOT EXISTS evaluations ("
+                        + "uid VARCHAR(36) PRIMARY KEY,"
+                        + "code VARCHAR(20) NOT NULL,"
+                        + "nom VARCHAR(200) NOT NULL,"
+                        + "note DOUBLE PRECISION NOT NULL,"
+                        + "bareme DOUBLE PRECISION NOT NULL,"
+                        + "coef DOUBLE PRECISION NOT NULL,"
+                        + "cree_le BIGINT NOT NULL)");
+            }
+            schemaPret = true;
         }
 
-        @Override
-        public void replace(FilterBypass fb, int offset, int length, String text, AttributeSet attrs) throws BadLocationException {
-            String currentText = fb.getDocument().getText(0, fb.getDocument().getLength());
-            String proposedText = currentText.substring(0, offset) + text + currentText.substring(offset + length);
+        static void envoyer(Connection c, Evaluation e) throws SQLException {
+            if (e.statut.equals(Stockage.DEL)) {
+                try (PreparedStatement st = c.prepareStatement("DELETE FROM evaluations WHERE uid = ?")) {
+                    st.setString(1, e.uid);
+                    st.executeUpdate();
+                }
+                return;
+            }
+            String sql = "INSERT INTO evaluations (uid, code, nom, note, bareme, coef, cree_le) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                       + "ON CONFLICT (uid) DO UPDATE SET code = EXCLUDED.code, nom = EXCLUDED.nom, note = EXCLUDED.note, "
+                       + "bareme = EXCLUDED.bareme, coef = EXCLUDED.coef";
+            try (PreparedStatement st = c.prepareStatement(sql)) {
+                st.setString(1, e.uid);
+                st.setString(2, e.code);
+                st.setString(3, e.nom);
+                st.setDouble(4, e.note);
+                st.setDouble(5, e.bareme);
+                st.setDouble(6, e.coef);
+                st.setLong(7, e.creeLe);
+                st.executeUpdate();
+            }
+        }
 
-            if (proposedText.matches("\\d*(/\\d*)?")) {
-                super.replace(fb, offset, length, text, attrs);
+        static List<Evaluation> lireTout(Connection c) throws SQLException {
+            List<Evaluation> l = new ArrayList<>();
+            try (PreparedStatement st = c.prepareStatement(
+                    "SELECT uid, code, nom, note, bareme, coef, cree_le FROM evaluations ORDER BY cree_le, uid");
+                 ResultSet rs = st.executeQuery()) {
+                while (rs.next()) {
+                    l.add(new Evaluation(rs.getString(1), rs.getString(2), rs.getString(3), rs.getDouble(4),
+                            rs.getDouble(5), rs.getDouble(6), rs.getLong(7), Stockage.SYNC));
+                }
+            }
+            return l;
+        }
+
+        /**
+         * Envoie les changements locaux, puis aligne le fichier sur la BDD.
+         * Sans effet (et immédiat) si la BDD n'est pas configurée ou vient d'échouer.
+         * À appeler hors de l'interface : via Bdd.planifier(...).
+         */
+        static synchronized void synchroniser() {
+            for (int passe = 0; passe < 3 && Bdd.disponible(); passe++) {
+                try (Connection c = Bdd.connexion()) {
+                    if (!schemaPret) creerTables(c);
+                    Map<String, String> envoyees = new HashMap<>();
+                    for (Evaluation e : Stockage.copiesEnAttente()) {
+                        try {
+                            envoyer(c, e);
+                            envoyees.put(e.uid, e.toLine());
+                        } catch (SQLException ex) {
+                            System.err.println("Envoi de l'évaluation " + e.uid + " impossible : " + ex.getMessage());
+                        }
+                    }
+                    boolean reste = Stockage.fusionner(lireTout(c), envoyees);
+                    if (!reste) return;
+                } catch (SQLException e) {
+                    System.err.println("BDD injoignable, notes gardées sur cet ordinateur : " + e.getMessage());
+                    return;
+                }
             }
         }
     }
 
-    /** Coefficient : 2 chiffres max avant et après la virgule ou le point (ex : 2, 0.5, 1,5). */
-    static class CoefFilter extends DocumentFilter {
-        @Override
-        public void insertString(FilterBypass fb, int offset, String string, AttributeSet attr) throws BadLocationException {
-            replace(fb, offset, 0, string, attr);
-        }
-
-        @Override
-        public void replace(FilterBypass fb, int offset, int length, String text, AttributeSet attrs) throws BadLocationException {
-            String currentText = fb.getDocument().getText(0, fb.getDocument().getLength());
-            String proposedText = currentText.substring(0, offset) + text + currentText.substring(offset + length);
-
-            if (proposedText.matches("\\d{0,2}([.,]\\d{0,2})?")) {
-                super.replace(fb, offset, length, text, attrs);
-            }
-        }
+    /** Moyennes calculées à partir du fichier local (instantané). */
+    static Programme.Resultat resultat() {
+        return Programme.calculer(Stockage.visibles());
     }
 
-    /** Lit un coefficient saisi ("1,5" ou "1.5"), arrondi à 2 décimales. null si vide ou invalide. */
-    static Double parseCoef(String saisie) {
-        if (saisie == null) return null;
-        String t = saisie.trim().replace(',', '.');
-        if (t.isEmpty()) return null;
+    // =====================================================================
+    // FORMATAGE
+    // =====================================================================
+    private static final DecimalFormat NOMBRE = new DecimalFormat("0.##", DecimalFormatSymbols.getInstance(Locale.FRANCE));
+
+    /** 14.5 -> "14,5", 20.0 -> "20". */
+    static String nombre(double v) {
+        return NOMBRE.format(v);
+    }
+
+    /** Moyenne sur 20 : "12,34" ou "—". */
+    static String moyenne(Double v) {
+        return v == null ? "—" : String.format(Locale.FRANCE, "%.2f", v);
+    }
+
+    /** « 12,5 » ou « 12.5 » -> 12.5 ; null si invalide. */
+    static Double lireNombre(String s) {
+        if (s == null) return null;
+        String t = s.trim().replace(',', '.');
+        if (!t.matches("\\d+(\\.\\d*)?|\\.\\d+")) return null;
         try {
-            return Math.round(Double.parseDouble(t) * 100.0) / 100.0;
+            return Double.parseDouble(t);
         } catch (NumberFormatException e) {
             return null;
         }
     }
 
-    /** 2.0 -> "2", 0.5 -> "0.5" (toujours avec un point : sûr pour le CSV). */
-    static String formatCoef(double c) {
-        if (c == Math.rint(c)) return String.valueOf((long) c);
-        return String.valueOf(c);
-    }
-
-    static BigDecimal toDecimal(double c) {
-        return BigDecimal.valueOf(c).setScale(2, RoundingMode.HALF_UP);
-    }
-
-    static void ListMatiere() {
-        DefaultTableModel model = (DefaultTableModel) tableNote.getModel();
-        nomsMatieres = new String[model.getRowCount()];
-        for (int i = 0; i < model.getRowCount(); i++) {
-            nomsMatieres[i] = (String) model.getValueAt(i, 0);
-        }
-    }
-
-    /**
-     * Recharge complètement l'affichage de l'application (BDD si joignable, sinon CSV local).
-     */
-    static void rechargerApplication() {
-        chargerDonneesInitiales();
-
-        DefaultTableModel modelNote = new DefaultTableModel(donneesInitiales, colonnesInitiales) {
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return false;
-            }
+    static Color couleurStatut(Programme.Statut s) {
+        return switch (s) {
+            case VALIDE -> Theme.SUCCES;
+            case RATTRAPAGE -> Theme.ATTENTION;
+            case REFUSE -> Theme.RETARD;
+            case EN_COURS -> Theme.ACCENT;
+            default -> Theme.TEXT_DISCRET;
         };
-        tableNote.setModel(modelNote);
-
-        tableMoyenne.setModel(modeleMoyennes());
-    }
-
-    /**
-     * Tableau des moyennes (matière, coefficient, moyenne) et mise à jour de la moyenne générale :
-     * somme(moyenne x coef de la matière) / somme(coefs), sur les matières qui ont au moins une note.
-     */
-    static DefaultTableModel modeleMoyennes() {
-        ListMatiere();
-        List<Double> moyennes = calculMoyenneGenerale();
-        Map<String, Double> coefs = CsvMirror.coefficientsMatieres();
-
-        DefaultTableModel modelMoyenne = new DefaultTableModel(new String[]{"Matière", "Coefficient", "Moyenne"}, 0) {
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return false;
-            }
-        };
-
-        double sommePonderee = 0, sommeCoefs = 0;
-        for (int i = 0; i < nomsMatieres.length; i++) {
-            Double m = (i < moyennes.size()) ? moyennes.get(i) : null;
-            double coef = coefs.getOrDefault(nomsMatieres[i], 1.0);
-            if (m != null) {
-                sommePonderee += m * coef;
-                sommeCoefs += coef;
-            }
-            String affichage = (m == null) ? "" : String.format("%.2f", m);
-            modelMoyenne.addRow(new Object[]{ nomsMatieres[i], formatCoef(coef), affichage });
-        }
-
-        if (labelGenerale != null) {
-            if (sommeCoefs > 0) {
-                double g = sommePonderee / sommeCoefs;
-                labelGenerale.setText(String.format("Moyenne générale : %.2f / 20", g));
-                labelGenerale.setForeground(g >= 10 ? Theme.SUCCES : g >= 8 ? Theme.ATTENTION : Theme.RETARD);
-            } else {
-                labelGenerale.setText("Moyenne générale : —");
-                labelGenerale.setForeground(Theme.TEXT_DISCRET);
-            }
-        }
-        return modelMoyenne;
     }
 
     // =====================================================================
-    // SUPPRIMER LA NOTE SÉLECTIONNÉE DANS LE TABLEAU
+    // INTERFACE
     // =====================================================================
-    static void DeleteNote() {
-        java.awt.Component parent = javax.swing.SwingUtilities.getWindowAncestor(tableNote);
-
-        int row = tableNote.getSelectedRow();
-        int col = tableNote.getSelectedColumn();
-        if (row < 0 || col < 0) {
-            JOptionPane.showMessageDialog(parent, "Clique d'abord sur la case de la note à supprimer.", "Aucune sélection", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-
-        DefaultTableModel model = (DefaultTableModel) tableNote.getModel();
-        int modelRow = tableNote.convertRowIndexToModel(row);
-        int modelCol = tableNote.convertColumnIndexToModel(col);
-        Object cellule = model.getValueAt(modelRow, modelCol);
-        Matcher m = NOTE_AFFICHEE.matcher(cellule == null ? "" : cellule.toString());
-        if (modelCol < 1 || !m.matches()) {
-            JOptionPane.showMessageDialog(parent, "La case sélectionnée ne contient pas de note.", "Erreur", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
-
-        String matiereChoisie = (String) model.getValueAt(modelRow, 0);
-        int val = Integer.parseInt(m.group(1));
-        int quot = Integer.parseInt(m.group(2));
-        Double coef = (m.group(3) == null) ? 1.0 : Double.parseDouble(m.group(3));
-
-        // Remet d'abord BDD et CSV d'accord si la BDD vient de revenir
-        Database.synchroniser();
-
-        // 1) BDD : 1 = supprimée, 0 = introuvable, -1 = BDD injoignable
-        int res = -1;
-        if (Database.ping()) {
-            Integer matiereId = MatiereDAO.trouverIdParNom(matiereChoisie);
-            if (matiereId != null) res = NoteDAO.supprimer(matiereId, val, quot, coef);
-        }
-        if (res == 0) {
-            JOptionPane.showMessageDialog(parent, "Impossible de trouver cette note en BDD.", "Erreur", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
-
-        // 2) CSV local : mis à jour en même temps, dans tous les cas
-        boolean dbOk = (res == 1);
-        boolean trouveCsv = CsvMirror.supprimerNote(matiereChoisie, val, quot, coef, dbOk);
-        if (!dbOk && !trouveCsv) {
-            JOptionPane.showMessageDialog(parent, "Note introuvable dans le fichier local.", "Erreur", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
-
-        if (!dbOk && Config.bddConfiguree()) {
-            JOptionPane.showMessageDialog(parent, "Connexion BDD indisponible. La note a été supprimée du fichier local.\nElle sera supprimée de la BDD dès la reconnexion.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-        }
-        rechargerApplication();
-    }
-
-    // =====================================================================
-    // FENÊTRES AJOUT (MATIERE & NOTE)
-    // =====================================================================
-    static void AddMatiere() {
-        JFrame addMatiereFrame = new JFrame("Nouvelle Matière");
-        addMatiereFrame.setSize(600, 300);
-        addMatiereFrame.setLocationRelativeTo(null);
-        addMatiereFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        addMatiereFrame.getContentPane().setBackground(Theme.BACKGROUND);
-
-        JTextField matiereField = new JTextField(20);
-        styleTextField(matiereField);
-
-        JLabel labelMatiere = new JLabel("Nom de la matière :");
-        styleLabel(labelMatiere);
-
-        JTextField coefField = new JTextField("1", 10);
-        styleTextField(coefField);
-        ((PlainDocument) coefField.getDocument()).setDocumentFilter(new CoefFilter());
-        JLabel labelCoef = new JLabel("Coefficient :");
-        styleLabel(labelCoef);
-
-        JPanel centerPanel = new JPanel(new GridBagLayout());
-        centerPanel.setBackground(Theme.BACKGROUND);
-        GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(8, 8, 8, 8);
-        gbc.anchor = GridBagConstraints.WEST;
-
-        gbc.gridx = 0; gbc.gridy = 0;
-        centerPanel.add(labelMatiere, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(matiereField, gbc);
-
-        gbc.gridx = 0; gbc.gridy = 1; gbc.fill = GridBagConstraints.NONE;
-        centerPanel.add(labelCoef, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(coefField, gbc);
-
-        JButton validButton = themedButton("Valider");
-        validButton.addActionListener(e -> {
-            String saisie = matiereField.getText().trim();
-            if (!nomMatiereValide(addMatiereFrame, saisie)) return;
-            Double coefficient = parseCoef(coefField.getText());
-            if (coefficient == null || coefficient <= 0) {
-                JOptionPane.showMessageDialog(addMatiereFrame, "Coefficient invalide (ex : 1, 2, 0.5)", "Coefficient invalide", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-
-            Database.synchroniser();
-
-            if (Database.ping()) {
-                if (MatiereDAO.inserer(saisie, coefficient) == -1) {
-                    JOptionPane.showMessageDialog(addMatiereFrame, "Erreur lors de l'enregistrement ou matière existante.", "Erreur", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                CsvMirror.ajouterMatiere(saisie, coefficient, true);
-            } else {
-                if (CsvMirror.matiereExiste(saisie)) {
-                    JOptionPane.showMessageDialog(addMatiereFrame, "Cette matière existe déjà.", "Erreur", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                CsvMirror.ajouterMatiere(saisie, coefficient, false);
-                if (Config.bddConfiguree()) JOptionPane.showMessageDialog(addMatiereFrame, "Connexion BDD indisponible. La matière a été enregistrée dans le fichier local.\nElle sera envoyée à la BDD dès la reconnexion.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-            }
-
-            rechargerApplication();
-            addMatiereFrame.dispose();
-        });
-
-        JButton annulButton = Theme.boutonSecondaire("Annuler");
-        annulButton.addActionListener(e -> addMatiereFrame.dispose());
-
-        JPanel btnValidAnnulPanel = new JPanel();
-        btnValidAnnulPanel.setBackground(Theme.BACKGROUND);
-        btnValidAnnulPanel.add(validButton);
-        btnValidAnnulPanel.add(annulButton);
-
-        JPanel newMatierePanel = new JPanel(new BorderLayout());
-        newMatierePanel.setBackground(Theme.BACKGROUND);
-        newMatierePanel.setBorder(new EmptyBorder(20, 20, 20, 20));
-        newMatierePanel.add(centerPanel, BorderLayout.CENTER);
-        newMatierePanel.add(btnValidAnnulPanel, BorderLayout.SOUTH);
-
-        addMatiereFrame.getContentPane().add(newMatierePanel);
-        addMatiereFrame.setVisible(true);
-    }
-
-    static boolean nomMatiereValide(java.awt.Component parent, String nom) {
-        if (nom.isEmpty()) {
-            JOptionPane.showMessageDialog(parent, "Le nom ne peut pas être vide.", "Erreur", JOptionPane.ERROR_MESSAGE);
-            return false;
-        }
-        if (nom.contains(";")) {
-            JOptionPane.showMessageDialog(parent, "Le caractère ';' est interdit dans le nom (séparateur du CSV).", "Erreur", JOptionPane.ERROR_MESSAGE);
-            return false;
-        }
-        return true;
-    }
-
-    // =====================================================================
-    // PARAMÈTRES D'UNE MATIÈRE (double-clic sur la matière) : nom, coefficient, suppression
-    // =====================================================================
-    static void ModifierMatiere(String nom) {
-        double coefActuel = CsvMirror.coefficientsMatieres().getOrDefault(nom, 1.0);
-
-        JFrame frame = new JFrame("Paramètres de la matière");
-        frame.setSize(600, 320);
-        frame.setLocationRelativeTo(fenetre);
-        frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        frame.getContentPane().setBackground(Theme.BACKGROUND);
-
-        JTextField nomField = new JTextField(nom, 20);
-        styleTextField(nomField);
-        JTextField coefField = new JTextField(formatCoef(coefActuel), 10);
-        styleTextField(coefField);
-        ((PlainDocument) coefField.getDocument()).setDocumentFilter(new CoefFilter());
-
-        JLabel labelNom = new JLabel("Nom de la matière :");
-        JLabel labelCoef = new JLabel("Coefficient :");
-        styleLabel(labelNom);
-        styleLabel(labelCoef);
-
-        JPanel centerPanel = new JPanel(new GridBagLayout());
-        centerPanel.setBackground(Theme.BACKGROUND);
-        GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(8, 8, 8, 8);
-        gbc.anchor = GridBagConstraints.WEST;
-
-        gbc.gridx = 0; gbc.gridy = 0;
-        centerPanel.add(labelNom, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(nomField, gbc);
-
-        gbc.gridx = 0; gbc.gridy = 1; gbc.fill = GridBagConstraints.NONE;
-        centerPanel.add(labelCoef, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(coefField, gbc);
-
-        JButton validButton = themedButton("Enregistrer");
-        validButton.addActionListener(e -> {
-            String nouveauNom = nomField.getText().trim();
-            if (!nomMatiereValide(frame, nouveauNom)) return;
-            Double coefficient = parseCoef(coefField.getText());
-            if (coefficient == null || coefficient <= 0) {
-                JOptionPane.showMessageDialog(frame, "Coefficient invalide (ex : 1, 2, 0.5)", "Coefficient invalide", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-            boolean renomme = !nouveauNom.equals(nom);
-            if (renomme && !nouveauNom.equalsIgnoreCase(nom) && CsvMirror.matiereExiste(nouveauNom)) {
-                JOptionPane.showMessageDialog(frame, "Une matière porte déjà ce nom.", "Erreur", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-
-            Database.synchroniser();
-            boolean enLigne = Database.ping();
-
-            if (enLigne) {
-                if (!MatiereDAO.modifier(nom, nouveauNom, coefficient)) {
-                    JOptionPane.showMessageDialog(frame, "La base de données a refusé la modification.", "Erreur", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-            } else if (renomme && Config.bddConfiguree()) {
-                // Le renommage hors-ligne ne pourrait pas être retrouvé dans la BDD au retour en ligne
-                JOptionPane.showMessageDialog(frame, "Connexion BDD indisponible : impossible de renommer la matière hors-ligne.\nTu peux quand même changer son coefficient.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-                return;
-            }
-            CsvMirror.modifierMatiere(nom, nouveauNom, coefficient, enLigne);
-
-            rechargerApplication();
-            frame.dispose();
-        });
-
-        JButton deleteButton = Theme.boutonSecondaire("Supprimer la matière");
-        deleteButton.setForeground(Theme.RETARD);
-        deleteButton.addActionListener(e -> {
-            int nb = CsvMirror.listerNotes(nom).size();
-            int choix = JOptionPane.showConfirmDialog(frame,
-                    "Supprimer « " + nom + " »" + (nb > 0 ? " et ses " + nb + " note(s)" : "") + " ?\nCette action est définitive.",
-                    "Supprimer la matière", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-            if (choix != JOptionPane.YES_OPTION) return;
-
-            Database.synchroniser();
-            if (Database.ping()) {
-                if (!MatiereDAO.supprimer(nom)) {
-                    JOptionPane.showMessageDialog(frame, "La base de données a refusé la suppression.", "Erreur", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-            } else if (Config.bddConfiguree()) {
-                JOptionPane.showMessageDialog(frame, "Connexion BDD indisponible : impossible de supprimer une matière hors-ligne.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-                return;
-            }
-            CsvMirror.supprimerMatiere(nom);
-
-            rechargerApplication();
-            frame.dispose();
-        });
-
-        JButton annulButton = Theme.boutonSecondaire("Annuler");
-        annulButton.addActionListener(e -> frame.dispose());
-
-        JPanel btnPanel = new JPanel();
-        btnPanel.setBackground(Theme.BACKGROUND);
-        btnPanel.add(validButton);
-        btnPanel.add(annulButton);
-        btnPanel.add(deleteButton);
-
-        JPanel panel = new JPanel(new BorderLayout());
-        panel.setBackground(Theme.BACKGROUND);
-        panel.setBorder(new EmptyBorder(20, 20, 20, 20));
-        panel.add(centerPanel, BorderLayout.CENTER);
-        panel.add(btnPanel, BorderLayout.SOUTH);
-
-        frame.getContentPane().add(panel);
-        frame.getRootPane().setDefaultButton(validButton);
-        frame.setVisible(true);
-    }
-
-    /** Double-clic sur une matière (1re colonne des notes, ou n'importe où dans les moyennes) : ses paramètres. */
-    static void doubleClicMatiere(JTable table, boolean colonneMatiereSeulement) {
-        // mousePressed plutôt que mouseClicked : un "clic" n'est pas signalé si la souris bouge d'un pixel pendant l'appui
-        table.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mousePressed(MouseEvent e) {
-                if (e.getClickCount() != 2 || !SwingUtilities.isLeftMouseButton(e)) return;
-                int row = table.rowAtPoint(e.getPoint());
-                int col = table.columnAtPoint(e.getPoint());
-                if (row < 0 || col < 0) return;
-                if (colonneMatiereSeulement && table.convertColumnIndexToModel(col) != 0) return;
-                Object nom = table.getModel().getValueAt(table.convertRowIndexToModel(row), 0);
-                if (nom != null) ModifierMatiere(nom.toString());
-            }
-        });
-    }
-
-    static void AddNote() {
-        ListMatiere();
-        if (nomsMatieres.length == 0) {
-            JOptionPane.showMessageDialog(fenetre, "Ajoute d'abord une matière (bouton « Ajouter Une Matière »).", "Aucune matière", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-
-        JFrame addNoteFrame = new JFrame("Nouvelle Note");
-        addNoteFrame.setSize(600, 340);
-        addNoteFrame.setLocationRelativeTo(null);
-        addNoteFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        addNoteFrame.getContentPane().setBackground(Theme.BACKGROUND);
-
-        ListMatiere();
-        JComboBox<String> comboMatiere = new JComboBox<>(nomsMatieres);
-        comboMatiere.setFont(Theme.FONT_LABEL);
-
-        JTextField noteField = new JTextField(10);
-        styleTextField(noteField);
-        ((PlainDocument) noteField.getDocument()).setDocumentFilter(new NoteFilter());
-
-        JLabel labelMatiere = new JLabel("Matière :");
-        JLabel labelNote = new JLabel("Note :");
-        styleLabel(labelMatiere);
-        styleLabel(labelNote);
-
-        JTextField coefField = new JTextField("1", 10);
-        styleTextField(coefField);
-        ((PlainDocument) coefField.getDocument()).setDocumentFilter(new CoefFilter());
-        JLabel labelCoef = new JLabel("Coefficient :");
-        styleLabel(labelCoef);
-
-        JPanel centerPanel = new JPanel(new GridBagLayout());
-        centerPanel.setBackground(Theme.BACKGROUND);
-        GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(8, 8, 8, 8);
-        gbc.anchor = GridBagConstraints.WEST;
-
-        gbc.gridx = 0; gbc.gridy = 0;
-        centerPanel.add(labelMatiere, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(comboMatiere, gbc);
-
-        gbc.gridx = 0; gbc.gridy = 1; gbc.fill = GridBagConstraints.NONE;
-        centerPanel.add(labelNote, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(noteField, gbc);
-
-        gbc.gridx = 0; gbc.gridy = 2; gbc.fill = GridBagConstraints.NONE;
-        centerPanel.add(labelCoef, gbc);
-        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL;
-        centerPanel.add(coefField, gbc);
-
-        JButton validButton = themedButton("Valider");
-        validButton.addActionListener(e -> {
-            String saisie = noteField.getText();
-            if (!saisie.matches("\\d+/\\d+")) {
-                JOptionPane.showMessageDialog(addNoteFrame, "Format attendu : note/quotient (ex : 15/20)", "Format invalide", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-
-            String[] parts = saisie.split("/");
-            int note = Integer.parseInt(parts[0]);
-            int quotient = Integer.parseInt(parts[1]);
-
-            Double coefficient = parseCoef(coefField.getText());
-            if (coefficient == null || coefficient <= 0) {
-                JOptionPane.showMessageDialog(addNoteFrame, "Coefficient invalide (ex : 1, 2, 0.5)", "Coefficient invalide", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-
-            if (note > quotient) {
-                JOptionPane.showMessageDialog(addNoteFrame, "La note ne peut pas être supérieure au quotient", "Note invalide", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-
-            String matiereChoisie = (String) comboMatiere.getSelectedItem();
-
-            // Remet d'abord BDD et CSV d'accord si la BDD vient de revenir
-            Database.synchroniser();
-
-            Integer matiereId = MatiereDAO.trouverIdParNom(matiereChoisie);
-
-            // tentative d'insertion BDD
-            boolean insertionOk = false;
-            if (matiereId != null) {
-                insertionOk = NoteDAO.inserer(matiereId, note, quotient, coefficient);
-            }
-
-            // Le CSV local est mis à jour en même temps que la BDD
-            // (statut SYNC si la BDD a accepté la note, ADD si elle reste à envoyer)
-            CsvMirror.ajouterNote(matiereChoisie, note, quotient, coefficient, insertionOk);
-
-            if (!insertionOk && Config.bddConfiguree()) {
-                JOptionPane.showMessageDialog(addNoteFrame, "Connexion BDD indisponible. La note a été sauvegardée dans le fichier local (CSV).\nElle sera envoyée à la BDD dès la reconnexion.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-            } else {
-                JOptionPane.showMessageDialog(addNoteFrame, "Note enregistrée avec succès !");
-            }
-
-            rechargerApplication();
-            addNoteFrame.dispose();
-        });
-
-        JButton annulButton = Theme.boutonSecondaire("Annuler");
-        annulButton.addActionListener(e -> addNoteFrame.dispose());
-
-        JPanel btnValidAnnulPanel = new JPanel();
-        btnValidAnnulPanel.setBackground(Theme.BACKGROUND);
-        btnValidAnnulPanel.add(validButton);
-        btnValidAnnulPanel.add(annulButton);
-
-        JPanel newNotePanel = new JPanel(new BorderLayout());
-        newNotePanel.setBackground(Theme.BACKGROUND);
-        newNotePanel.setBorder(new EmptyBorder(20, 20, 20, 20));
-        newNotePanel.add(centerPanel, BorderLayout.CENTER);
-        newNotePanel.add(btnValidAnnulPanel, BorderLayout.SOUTH);
-
-        addNoteFrame.getContentPane().add(newNotePanel);
-        addNoteFrame.setVisible(true);
-    }
-
-    /** Format affiché dans le tableau : "15/20 (coef 2)" (le coef est optionnel, 1 par défaut). */
-    static final Pattern NOTE_AFFICHEE = Pattern.compile("(\\d+)/(\\d+)(?: \\(coef ([\\d.]+)\\))?");
-
-    /** Moyenne pondérée par matière, sur 20 : somme((note/quotient) x coef) / somme(coef) x 20. */
-    static List<Double> calculMoyenneGenerale() {
-        DefaultTableModel model = (DefaultTableModel) tableNote.getModel();
-        List<Double> moyennesParMatiere = new ArrayList<>();
-
-        for (int row = 0; row < model.getRowCount(); row++) {
-            double sommePonderee = 0;
-            double sommeCoefs = 0;
-
-            for (int col = 1; col < model.getColumnCount(); col++) {
-                Object valeur = model.getValueAt(row, col);
-                String texte = (valeur == null) ? "" : valeur.toString();
-
-                Matcher m = NOTE_AFFICHEE.matcher(texte);
-                if (m.matches()) {
-                    double quotient = Double.parseDouble(m.group(2));
-                    double coef = (m.group(3) == null) ? 1.0 : Double.parseDouble(m.group(3));
-                    if (quotient > 0) {
-                        sommePonderee += (Double.parseDouble(m.group(1)) / quotient) * coef;
-                        sommeCoefs += coef;
-                    }
-                }
-            }
-
-            if (sommeCoefs > 0) {
-                moyennesParMatiere.add((sommePonderee / sommeCoefs) * 20);
-            } else {
-                moyennesParMatiere.add(null);
-            }
-        }
-        return moyennesParMatiere;
-    }
-
-    static void styleTextField(JTextField field) {
-        Theme.styleChamp(field);
-    }
-
-    static void styleLabel(JLabel label) {
-        Theme.styleLabel(label);
-    }
-
-    static Object[][] donneesInitiales;
-    static String[] colonnesInitiales;
-
-    /**
-     * Charge les données à afficher depuis le CSV local.
-     * Juste avant, si la BDD est joignable, BDD et CSV sont comparés puis alignés
-     * (le CSV reflète donc la BDD en ligne, et reste le témoin hors-ligne).
-     */
-    static void chargerDonneesInitiales() {
-        Database.synchroniser();
-
-        List<String> noms = CsvMirror.listerMatieres();
-        List<List<String>> notesParMatiere = new ArrayList<>();
-        int maxNotes = 0;
-
-        for (String nom : noms) {
-            List<String> notesMatiere = CsvMirror.listerNotes(nom);
-            notesParMatiere.add(notesMatiere);
-            maxNotes = Math.max(maxNotes, notesMatiere.size());
-        }
-        if (maxNotes == 0) maxNotes = 1;
-
-        colonnesInitiales = new String[maxNotes + 1];
-        colonnesInitiales[0] = "Matière";
-        for (int i = 1; i <= maxNotes; i++) colonnesInitiales[i] = "Note " + i;
-
-        donneesInitiales = new Object[noms.size()][maxNotes + 1];
-        for (int i = 0; i < noms.size(); i++) {
-            donneesInitiales[i][0] = noms.get(i);
-            List<String> notesMatiere = notesParMatiere.get(i);
-            for (int c = 1; c <= maxNotes; c++) {
-                donneesInitiales[i][c] = (c - 1 < notesMatiere.size()) ? notesMatiere.get(c - 1) : "";
-            }
-        }
-
-        columnNote[0] = maxNotes + 1;
-    }
 
     // Fenêtre ouverte (utilisée par le tableau de bord Main.java pour ne pas l'ouvrir deux fois).
     // Lancé seul, fermer la fenêtre quitte l'appli ; ouvert depuis Main, seule la fenêtre se ferme.
     static volatile JFrame fenetre;
     static int fermeture = JFrame.EXIT_ON_CLOSE;
 
-    public static void main(String[] args) {
+    private static final Preferences PREFS = Preferences.userNodeForPackage(Note.class);
 
-        // Évite de figer l'appli plusieurs secondes à chaque test si le Raspberry Pi est injoignable
-        DriverManager.setLoginTimeout(3);
+    // éléments mis à jour par rafraichir()
+    static JLabel valeurGenerale, detailGenerale;
+    static Theme.Pastille pastilleStatut, pastilleSynchro;
+    static Theme.Barre barreGenerale;
+    static JPanel grilleUe, listeRessources, listeSaes;
+    static Bandeau bandeau;
+    static final Set<String> ouvertes = new HashSet<>();
 
-        // Aucune matière au premier lancement : l'utilisateur ajoute les siennes
-        if (Database.connecter()) {
-            Database.creerTables();
+    /** Panneau qui suit la largeur de la fenêtre (le contenu se resserre au lieu de déborder). */
+    static final class Colonne extends JPanel implements Scrollable {
+        Colonne() {
+            super(new GridBagLayout());
+            setBackground(Theme.BACKGROUND);
         }
 
-        // Compare BDD/CSV (si en ligne) puis charge l'affichage
-        chargerDonneesInitiales();
+        @Override public Dimension getPreferredScrollableViewportSize() { return getPreferredSize(); }
+        @Override public int getScrollableUnitIncrement(Rectangle r, int o, int d) { return 18; }
+        @Override public int getScrollableBlockIncrement(Rectangle r, int o, int d) { return r.height - 40; }
+        @Override public boolean getScrollableTracksViewportWidth() { return true; }
+        @Override public boolean getScrollableTracksViewportHeight() { return false; }
+    }
 
+    /** Message en bas de la fenêtre (« Note ajoutée », « Note supprimée · Annuler »), disparaît seul. */
+    static final class Bandeau extends JPanel {
+        private final JLabel texte = new JLabel();
+        private final JButton action = Theme.boutonSecondaire("");
+        private final Timer timer = new Timer(6000, e -> setVisible(false));
+        private Runnable surAction;
+
+        Bandeau() {
+            super(new FlowLayout(FlowLayout.CENTER, 12, 0));
+            setOpaque(false);
+            setBorder(new EmptyBorder(0, 0, 14, 0));
+            texte.setFont(Theme.FONT_TABLE.deriveFont(Font.BOLD));
+            Theme.PanneauArrondi bulle = new Theme.PanneauArrondi(new FlowLayout(FlowLayout.CENTER, 12, 0), 999);
+            bulle.setBackground(Theme.SURFACE_ALT);
+            bulle.setBorder(new EmptyBorder(6, 16, 6, 6));
+            bulle.add(texte);
+            bulle.add(action);
+            add(bulle);
+            action.addActionListener(e -> {
+                setVisible(false);
+                if (surAction != null) surAction.run();
+            });
+            timer.setRepeats(false);
+            setVisible(false);
+        }
+
+        void montrer(String message, Color couleur, String libelleAction, Runnable r) {
+            texte.setText(message);
+            texte.setForeground(couleur);
+            surAction = r;
+            action.setVisible(libelleAction != null);
+            action.setText(libelleAction == null ? "" : libelleAction);
+            setVisible(true);
+            revalidate();
+            timer.restart();
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Formulaire d'évaluation (ajout en haut de page, modification en fenêtre)
+    // ---------------------------------------------------------------------
+    static final class Formulaire {
+        final JComboBox<Programme.Matiere> matiere = new JComboBox<>(Programme.TOUTES.toArray(new Programme.Matiere[0]));
+        final JTextField nom = new JTextField(14);
+        final JTextField note = new JTextField(5);
+        final JTextField bareme = new JTextField("20", 4);
+        final JTextField coef = new JTextField("1", 4);
+        final JLabel erreur = new JLabel(" ");
+
+        Formulaire() {
+            matiere.setFont(Theme.FONT_LABEL);
+            matiere.setMaximumRowCount(18);
+            matiere.setRenderer(new DefaultListCellRenderer() {
+                @Override
+                public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean sel, boolean focus) {
+                    super.getListCellRendererComponent(list, value, index, sel, focus);
+                    if (value instanceof Programme.Matiere m) {
+                        setText(index < 0 ? m.libelle()
+                                : "<html><b>" + m.code() + "</b>&nbsp;&nbsp;" + Main.echapper(m.nom()) + "</html>");
+                        setToolTipText(m.nom());
+                    }
+                    setBorder(new EmptyBorder(5, 8, 5, 8));
+                    return this;
+                }
+            });
+            for (JTextField f : new JTextField[]{nom, note, bareme, coef}) Theme.styleChamp(f);
+            nom.putClientProperty(FlatClientProperties.PLACEHOLDER_TEXT, "DS1, TP noté...");
+            note.putClientProperty(FlatClientProperties.PLACEHOLDER_TEXT, "14,5");
+            note.setToolTipText("Note obtenue. Tu peux aussi taper « 15/20 ».");
+            erreur.setFont(Theme.FONT_PETIT);
+            erreur.setForeground(Theme.RETARD);
+        }
+
+        void remplir(Evaluation e) {
+            matiere.setSelectedItem(Programme.matiere(e.code));
+            nom.setText(e.nom);
+            note.setText(nombre(e.note));
+            bareme.setText(nombre(e.bareme));
+            coef.setText(nombre(e.coef));
+        }
+
+        /** Lit et vérifie la saisie ; affiche l'erreur sous le formulaire et renvoie null si invalide. */
+        Evaluation lire(String uid, long creeLe) {
+            Programme.Matiere m = (Programme.Matiere) matiere.getSelectedItem();
+            String saisieNote = note.getText().trim();
+            String saisieBareme = bareme.getText().trim();
+            if (saisieNote.contains("/")) { // « 15/20 » tapé dans le champ note
+                String[] p = saisieNote.split("/", 2);
+                saisieNote = p[0];
+                saisieBareme = p[1];
+                bareme.setText(saisieBareme.trim());
+                note.setText(saisieNote.trim());
+            }
+            Double n = lireNombre(saisieNote), b = lireNombre(saisieBareme), c = lireNombre(coef.getText());
+            String nomEval = nom.getText().trim().replaceAll("\\s+", " ");
+
+            String probleme = null;
+            if (m == null) probleme = "Choisis une matière ou une SAÉ.";
+            else if (saisieNote.isEmpty()) probleme = "Indique la note.";
+            else if (n == null) probleme = "Note invalide (ex : 12,5).";
+            else if (b == null || b <= 0) probleme = "Barème invalide (ex : 20).";
+            else if (b > 1000) probleme = "Barème trop grand (1000 maximum).";
+            else if (n > b) probleme = "La note dépasse le barème (" + nombre(b) + ").";
+            else if (c == null || c <= 0) probleme = "Coefficient invalide (ex : 1 ou 1,5).";
+            else if (c > 100) probleme = "Coefficient trop grand (100 maximum).";
+            else if (nomEval.length() > 120) probleme = "Nom trop long (120 caractères maximum).";
+
+            if (probleme != null) {
+                erreur.setText(probleme);
+                return null;
+            }
+            erreur.setText(" ");
+            if (nomEval.isEmpty()) nomEval = "Évaluation";
+            return new Evaluation(uid, m.code(), nomEval, n, b, c, creeLe, Stockage.ADD);
+        }
+
+        /** Champs avec leur libellé au-dessus, sur une ligne. */
+        JPanel ligne(JButton bouton) {
+            JPanel p = new JPanel(new GridBagLayout());
+            p.setOpaque(false);
+            GridBagConstraints g = new GridBagConstraints();
+            g.gridy = 0;
+            g.anchor = GridBagConstraints.WEST;
+            g.insets = new Insets(0, 0, 6, 10);
+            String[] libelles = {"Matière / SAÉ", "Nom de l'évaluation", "Note", "Sur", "Coef."};
+            JComponent[] champs = {matiere, nom, note, bareme, coef};
+            double[] poids = {0.5, 0.5, 0, 0, 0};
+            for (int i = 0; i < champs.length; i++) {
+                g.gridx = i;
+                g.gridy = 0;
+                g.weightx = poids[i];
+                g.fill = GridBagConstraints.HORIZONTAL;
+                p.add(Theme.surtitre(libelles[i]), g);
+                g.gridy = 1;
+                g.insets = new Insets(0, 0, 0, 10);
+                Dimension d = champs[i].getPreferredSize();
+                if (poids[i] == 0) champs[i].setPreferredSize(new Dimension(i == 2 ? 80 : 64, d.height));
+                else champs[i].setPreferredSize(new Dimension(160, d.height));
+                p.add(champs[i], g);
+                g.insets = new Insets(0, 0, 6, 10);
+            }
+            if (bouton != null) {
+                g.gridx = champs.length;
+                g.gridy = 1;
+                g.weightx = 0;
+                g.insets = new Insets(0, 4, 0, 0);
+                p.add(bouton, g);
+            }
+            g.gridx = 0;
+            g.gridy = 2;
+            g.gridwidth = champs.length + 1;
+            g.insets = new Insets(6, 2, 0, 0);
+            p.add(erreur, g);
+            return p;
+        }
+    }
+
+    static JPanel carteAjout() {
+        Formulaire f = new Formulaire();
+        String derniere = PREFS.get("derniereMatiere", null);
+        if (derniere != null && Programme.existe(derniere)) f.matiere.setSelectedItem(Programme.matiere(derniere));
+
+        JButton ajouter = Theme.bouton("Ajouter");
+        ajouter.addActionListener(e -> {
+            Evaluation ev = f.lire(UUID.randomUUID().toString(), System.currentTimeMillis());
+            if (ev == null) return;
+            Stockage.ajouter(ev);
+            try { PREFS.put("derniereMatiere", ev.code); } catch (Exception ignored) { }
+            ouvertes.add(ev.code);
+            f.nom.setText("");
+            f.note.setText("");
+            f.note.requestFocusInWindow();
+            apresChangement();
+            bandeau.montrer("✓  " + nombre(ev.note) + "/" + nombre(ev.bareme) + " ajouté en " + ev.code,
+                    Theme.SUCCES, null, null);
+        });
+
+        Theme.PanneauArrondi carte = Theme.carte(new BorderLayout(0, 12), 20);
+        carte.setBorder(new EmptyBorder(18, 20, 8, 20));
+        JLabel titre = new JLabel("Ajouter une évaluation");
+        titre.setFont(Theme.FONT_SECTION);
+        titre.setForeground(Theme.TEXT_PRIMARY);
+        carte.add(titre, BorderLayout.NORTH);
+        carte.add(f.ligne(ajouter), BorderLayout.CENTER);
+
+        // Entrée dans n'importe quel champ = Ajouter
+        for (JTextField c : new JTextField[]{f.nom, f.note, f.bareme, f.coef}) c.addActionListener(e -> ajouter.doClick());
+        return carte;
+    }
+
+    static void modifier(Evaluation e) {
+        JDialog d = new JDialog(fenetre, "Modifier l'évaluation", true);
+        d.getContentPane().setBackground(Theme.BACKGROUND);
+        Formulaire f = new Formulaire();
+        f.remplir(e);
+
+        JButton enregistrer = Theme.bouton("Enregistrer");
+        JButton annuler = Theme.boutonSecondaire("Annuler");
+        annuler.addActionListener(x -> d.dispose());
+        enregistrer.addActionListener(x -> {
+            Evaluation nouvelle = f.lire(e.uid, e.creeLe);
+            if (nouvelle == null) return;
+            Stockage.modifier(nouvelle);
+            ouvertes.add(nouvelle.code);
+            d.dispose();
+            apresChangement();
+            bandeau.montrer("✓  Évaluation modifiée", Theme.SUCCES, null, null);
+        });
+
+        JPanel boutons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        boutons.setOpaque(false);
+        boutons.add(annuler);
+        boutons.add(enregistrer);
+
+        Theme.PanneauArrondi carte = Theme.carte(new BorderLayout(0, 18), 22);
+        carte.add(f.ligne(null), BorderLayout.CENTER);
+        carte.add(boutons, BorderLayout.SOUTH);
+
+        JPanel fond = new JPanel(new BorderLayout());
+        fond.setBackground(Theme.BACKGROUND);
+        fond.setBorder(new EmptyBorder(16, 16, 16, 16));
+        fond.add(carte);
+        d.setContentPane(fond);
+        d.getRootPane().setDefaultButton(enregistrer);
+        d.pack();
+        d.setSize(Math.max(760, d.getWidth()), d.getHeight());
+        d.setLocationRelativeTo(fenetre);
+        d.setVisible(true);
+    }
+
+    static void supprimer(Evaluation e) {
+        Evaluation avant = Stockage.supprimer(e.uid);
+        if (avant == null) return;
+        apresChangement();
+        bandeau.montrer(e.nom + " (" + nombre(e.note) + "/" + nombre(e.bareme) + ") supprimée", Theme.TEXT_PRIMARY,
+                "Annuler", () -> {
+                    Stockage.restaurer(avant);
+                    apresChangement();
+                });
+    }
+
+    /** Après chaque modification : affichage tout de suite, BDD ensuite en arrière-plan. */
+    static void apresChangement() {
+        rafraichir();
+        Bdd.planifier(Database::synchroniser, Note::rafraichir);
+    }
+
+    // ---------------------------------------------------------------------
+    // Cartes du haut : moyenne générale, UE
+    // ---------------------------------------------------------------------
+    static JPanel carteGenerale() {
+        Theme.PanneauArrondi carte = Theme.carte(new GridBagLayout(), 22);
+        GridBagConstraints g = new GridBagConstraints();
+        g.gridx = 0;
+        g.gridy = 0;
+        g.anchor = GridBagConstraints.WEST;
+        g.fill = GridBagConstraints.HORIZONTAL;
+        g.weightx = 1;
+
+        JPanel haut = new JPanel(new BorderLayout());
+        haut.setOpaque(false);
+        haut.add(Theme.surtitre("Moyenne générale"), BorderLayout.WEST);
+        haut.add(new Theme.Pastille("Semestre 1", Theme.ACCENT), BorderLayout.EAST);
+        carte.add(haut, g);
+
+        valeurGenerale = new JLabel("—");
+        valeurGenerale.setFont(Theme.FONT_CHIFFRE);
+        JLabel sur = new JLabel(" / 20");
+        sur.setFont(Theme.FONT_CHIFFRE_MOYEN.deriveFont(Font.PLAIN));
+        sur.setForeground(Theme.TEXT_DISCRET);
+        JPanel chiffre = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        chiffre.setOpaque(false);
+        chiffre.add(valeurGenerale);
+        chiffre.add(sur);
+        g.gridy++;
+        g.insets = new Insets(10, 0, 8, 0);
+        carte.add(chiffre, g);
+
+        barreGenerale = new Theme.Barre(0, Theme.ACCENT, 8);
+        g.gridy++;
+        g.insets = new Insets(0, 0, 14, 0);
+        carte.add(barreGenerale, g);
+
+        pastilleStatut = new Theme.Pastille("Non calculé", Theme.TEXT_DISCRET);
+        JPanel ligneStatut = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        ligneStatut.setOpaque(false);
+        ligneStatut.add(pastilleStatut);
+        g.gridy++;
+        g.insets = new Insets(0, 0, 10, 0);
+        carte.add(ligneStatut, g);
+
+        detailGenerale = Theme.info(" ");
+        detailGenerale.setFont(Theme.FONT_PETIT);
+        g.gridy++;
+        g.weighty = 1;
+        g.anchor = GridBagConstraints.SOUTHWEST;
+        g.insets = new Insets(0, 0, 0, 0);
+        carte.add(detailGenerale, g);
+        return carte;
+    }
+
+    static JPanel carteUes() {
+        Theme.PanneauArrondi carte = Theme.carte(new BorderLayout(0, 14), 20);
+        JPanel haut = new JPanel(new BorderLayout());
+        haut.setOpaque(false);
+        haut.add(Theme.surtitre("Unités d'enseignement"), BorderLayout.WEST);
+        JLabel aide = Theme.info("Survole une UE pour voir le détail du calcul");
+        aide.setFont(Theme.FONT_PETIT);
+        haut.add(aide, BorderLayout.EAST);
+        carte.add(haut, BorderLayout.NORTH);
+        grilleUe = new JPanel(new GridLayout(2, 3, 12, 12));
+        grilleUe.setOpaque(false);
+        carte.add(grilleUe, BorderLayout.CENTER);
+        return carte;
+    }
+
+    static JPanel tuileUe(Programme.Ue ue, Programme.Resultat r) {
+        Double m = r.moyennesUe().get(ue.code());
+        Color couleur = m == null ? Theme.TEXT_DISCRET : Theme.couleurMoyenne(m);
+
+        Theme.PanneauArrondi t = new Theme.PanneauArrondi(new GridBagLayout(), 14);
+        t.setBackground(Theme.SURFACE_ALT);
+        t.setBordure(false);
+        t.setBorder(new EmptyBorder(12, 14, 12, 14));
+        GridBagConstraints g = new GridBagConstraints();
+        g.gridx = 0;
+        g.gridy = 0;
+        g.weightx = 1;
+        g.fill = GridBagConstraints.HORIZONTAL;
+        g.anchor = GridBagConstraints.WEST;
+
+        JLabel code = new JLabel(ue.code());
+        code.setFont(Theme.FONT_BUTTON);
+        code.setForeground(Theme.TEXT_DISCRET);
+        JLabel valeur = new JLabel(moyenne(m));
+        valeur.setFont(Theme.FONT_CHIFFRE_MOYEN);
+        valeur.setForeground(m == null ? Theme.TEXT_DISCRET : couleur);
+        valeur.setHorizontalAlignment(SwingConstants.RIGHT);
+        JPanel haut = new JPanel(new BorderLayout());
+        haut.setOpaque(false);
+        haut.add(code, BorderLayout.WEST);
+        haut.add(valeur, BorderLayout.EAST);
+        t.add(haut, g);
+
+        g.gridy++;
+        g.insets = new Insets(6, 0, 8, 0);
+        t.add(new Theme.Barre(m == null ? 0 : m / 20, couleur, 5), g);
+
+        JLabel nom = new JLabel(ue.nom());
+        nom.setFont(Theme.FONT_PETIT);
+        nom.setForeground(Theme.TEXT_DISCRET);
+        nom.setPreferredSize(new Dimension(60, nom.getPreferredSize().height)); // coupé avec « ... » si trop long
+        g.gridy++;
+        g.insets = new Insets(0, 0, 0, 0);
+        t.add(nom, g);
+
+        String detail = detailUeHtml(ue, r);
+        t.setToolTipText(detail);
+        for (Component c : new Component[]{haut, code, valeur, nom}) ((JComponent) c).setToolTipText(detail);
+        return t;
+    }
+
+    /** Infobulle : chaque matière de l'UE, sa moyenne, son coefficient, et le résultat. */
+    static String detailUeHtml(Programme.Ue ue, Programme.Resultat r) {
+        String discret = Theme.hex(Theme.TEXT_DISCRET);
+        StringBuilder sb = new StringBuilder("<html><div style='padding:2px'>");
+        sb.append("<b>").append(ue.code()).append(" · ").append(Main.echapper(ue.nom())).append("</b><br>");
+        sb.append("<table cellspacing=0 cellpadding=2 style='margin-top:6px'>");
+        sb.append("<tr style='color:").append(discret).append("'><td>Matière</td><td align=right>Moy.</td>"
+                + "<td align=right>Coef.</td><td align=right>Produit</td></tr>");
+        double somme = 0;
+        int coefs = 0, coefsTotal = 0;
+        for (Programme.LigneUe l : r.detailUe(ue.code())) {
+            coefsTotal += l.coef();
+            boolean compte = l.moyenne() != null;
+            String style = compte ? "" : " style='color:" + discret + "'";
+            Programme.Matiere m = Programme.matiere(l.code());
+            sb.append("<tr").append(style).append("><td>").append(l.code()).append(" ")
+              .append(Main.echapper(m == null ? "" : raccourcir(m.nom(), 26))).append("</td><td align=right>")
+              .append(compte ? moyenne(l.moyenne()) : "—").append("</td><td align=right>").append(l.coef())
+              .append("</td><td align=right>").append(compte ? moyenne(l.moyenne() * l.coef()) : "—").append("</td></tr>");
+            if (compte) {
+                somme += l.moyenne() * l.coef();
+                coefs += l.coef();
+            }
+        }
+        sb.append("</table><div style='margin-top:6px'>");
+        Double m = r.moyennesUe().get(ue.code());
+        if (m == null) {
+            sb.append("Aucune note dans cette UE pour l'instant.");
+        } else {
+            sb.append(moyenne(somme)).append(" ÷ ").append(coefs).append(" = <b>").append(moyenne(m)).append("</b>");
+            if (coefs < coefsTotal) {
+                sb.append("<br><span style='color:").append(discret).append("'>Calcul sur ").append(coefs).append(" coef. sur ")
+                  .append(coefsTotal).append(" (les matières sans note sont ignorées)</span>");
+            }
+        }
+        sb.append("</div></div></html>");
+        return sb.toString();
+    }
+
+    static String raccourcir(String s, int max) {
+        return s.length() <= max ? s : s.substring(0, max - 1) + "…";
+    }
+
+    // ---------------------------------------------------------------------
+    // Listes des ressources et des SAÉ (accordéon)
+    // ---------------------------------------------------------------------
+    static JPanel carteListe(String titre, String sousTitre, JPanel liste) {
+        Theme.PanneauArrondi carte = Theme.carte(new BorderLayout(0, 12), 18);
+        JPanel haut = new JPanel(new GridLayout(2, 1, 0, 2));
+        haut.setOpaque(false);
+        JLabel t = new JLabel(titre);
+        t.setFont(Theme.FONT_SECTION);
+        t.setForeground(Theme.TEXT_PRIMARY);
+        JLabel s = Theme.info(sousTitre);
+        s.setFont(Theme.FONT_PETIT);
+        haut.add(t);
+        haut.add(s);
+        carte.add(haut, BorderLayout.NORTH);
+        carte.add(liste, BorderLayout.CENTER);
+        return carte;
+    }
+
+    static JPanel lignesMatieres(List<Programme.Matiere> matieres, Map<String, List<Evaluation>> parMatiere,
+                                 Programme.Resultat r) {
+        JPanel p = new JPanel(new GridBagLayout());
+        p.setOpaque(false);
+        GridBagConstraints g = new GridBagConstraints();
+        g.gridx = 0;
+        g.gridy = 0;
+        g.weightx = 1;
+        g.fill = GridBagConstraints.HORIZONTAL;
+        g.insets = new Insets(0, 0, 8, 0);
+        for (Programme.Matiere m : matieres) {
+            p.add(ligneMatiere(m, parMatiere.getOrDefault(m.code(), List.of()), r.moyennesMatieres().get(m.code())), g);
+            g.gridy++;
+        }
+        return p;
+    }
+
+    static JPanel ligneMatiere(Programme.Matiere m, List<Evaluation> evals, Double moy) {
+        boolean ouverte = ouvertes.contains(m.code());
+        Color couleur = moy == null ? Theme.BORDER : Theme.couleurMoyenne(moy);
+
+        Theme.PanneauArrondi bloc = new Theme.PanneauArrondi(new BorderLayout(), 14);
+        bloc.setBackground(Theme.SURFACE_ALT);
+        bloc.setBordure(false);
+        bloc.setBande(couleur, 4);
+
+        // --- en-tête cliquable ---
+        JPanel tete = new JPanel(new BorderLayout(12, 0));
+        tete.setOpaque(false);
+        tete.setBorder(new EmptyBorder(10, 16, 10, 12));
+        tete.setCursor(new Cursor(Cursor.HAND_CURSOR));
+
+        JLabel fleche = new JLabel(ouverte ? Theme.Icone.CHEVRON_BAS : Theme.Icone.CHEVRON_DROITE);
+        fleche.setForeground(Theme.TEXT_DISCRET);
+        JLabel code = new JLabel(m.code());
+        code.setFont(Theme.FONT_BUTTON);
+        code.setForeground(Theme.ACCENT);
+        code.setPreferredSize(new Dimension(m.sae() ? 70 : 50, code.getPreferredSize().height));
+        JPanel gauche = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        gauche.setOpaque(false);
+        gauche.add(fleche);
+        gauche.add(code);
+
+        JPanel milieu = new JPanel(new GridLayout(2, 1, 0, 1));
+        milieu.setOpaque(false);
+        JLabel nom = new JLabel(m.nom());
+        nom.setFont(Theme.FONT_TABLE.deriveFont(Font.BOLD));
+        nom.setForeground(Theme.TEXT_PRIMARY);
+        nom.setPreferredSize(new Dimension(80, nom.getPreferredSize().height));
+        nom.setToolTipText(m.nom());
+        int n = evals.size();
+        JLabel nb = new JLabel(n == 0 ? "Aucune note" : n + " note" + (n > 1 ? "s" : ""));
+        nb.setFont(Theme.FONT_PETIT);
+        nb.setForeground(Theme.TEXT_DISCRET);
+        milieu.add(nom);
+        milieu.add(nb);
+
+        JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+        droite.setOpaque(false);
+        Theme.Barre barre = new Theme.Barre(moy == null ? 0 : moy / 20, couleur);
+        barre.setPreferredSize(new Dimension(70, 10));
+        droite.add(barre);
+        JLabel valeur = new JLabel(moyenne(moy));
+        valeur.setFont(Theme.FONT_BUTTON.deriveFont(15f));
+        valeur.setForeground(moy == null ? Theme.TEXT_DISCRET : couleur);
+        valeur.setHorizontalAlignment(SwingConstants.RIGHT);
+        valeur.setPreferredSize(new Dimension(48, valeur.getPreferredSize().height));
+        droite.add(valeur);
+
+        tete.add(gauche, BorderLayout.WEST);
+        tete.add(milieu, BorderLayout.CENTER);
+        tete.add(droite, BorderLayout.EAST);
+        tete.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) { bloc.setBackground(Theme.SURFACE_HOVER); }
+            @Override public void mouseExited(MouseEvent e) { bloc.setBackground(Theme.SURFACE_ALT); }
+            @Override public void mousePressed(MouseEvent e) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return;
+                if (!ouvertes.remove(m.code())) ouvertes.add(m.code());
+                rafraichir();
+            }
+        });
+        bloc.add(tete, BorderLayout.NORTH);
+
+        // --- détail : notes + UE concernées ---
+        if (ouverte) {
+            JPanel detail = new JPanel(new GridBagLayout());
+            detail.setOpaque(false);
+            detail.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createMatteBorder(1, 0, 0, 0, Theme.BORDER),
+                    new EmptyBorder(8, 18, 10, 12)));
+            GridBagConstraints g = new GridBagConstraints();
+            g.gridx = 0;
+            g.gridy = 0;
+            g.weightx = 1;
+            g.fill = GridBagConstraints.HORIZONTAL;
+            if (evals.isEmpty()) {
+                JLabel vide = Theme.info("Pas encore de note : ajoute-la avec le formulaire au-dessus.");
+                vide.setFont(Theme.FONT_PETIT);
+                detail.add(vide, g);
+                g.gridy++;
+            }
+            for (Evaluation e : evals) {
+                detail.add(ligneEvaluation(e), g);
+                g.gridy++;
+            }
+            StringBuilder ues = new StringBuilder("Compte dans ");
+            boolean premier = true;
+            for (Map.Entry<String, Integer> u : Programme.uesDe(m.code()).entrySet()) {
+                if (!premier) ues.append("  ·  ");
+                ues.append(u.getKey()).append(" (coef ").append(u.getValue()).append(")");
+                premier = false;
+            }
+            JLabel lUes = Theme.info(ues.toString());
+            lUes.setFont(Theme.FONT_PETIT);
+            g.insets = new Insets(8, 0, 0, 0);
+            detail.add(lUes, g);
+            bloc.add(detail, BorderLayout.CENTER);
+        }
+        return bloc;
+    }
+
+    static JPanel ligneEvaluation(Evaluation e) {
+        JPanel l = new JPanel(new BorderLayout(10, 0));
+        l.setOpaque(false);
+        l.setBorder(new EmptyBorder(4, 0, 4, 0));
+
+        JLabel nom = new JLabel(e.nom);
+        nom.setFont(Theme.FONT_TABLE);
+        nom.setForeground(Theme.TEXT_PRIMARY);
+        nom.setPreferredSize(new Dimension(60, nom.getPreferredSize().height));
+        nom.setToolTipText(e.nom + (e.statut.equals(Stockage.SYNC) ? "" : "  (pas encore envoyée à la BDD)"));
+
+        JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        droite.setOpaque(false);
+        JLabel note = new JLabel(nombre(e.note) + " / " + nombre(e.bareme));
+        note.setFont(Theme.FONT_TABLE.deriveFont(Font.BOLD));
+        note.setForeground(e.surVingt() >= 10 ? Theme.SUCCES : Theme.RETARD);
+        JLabel coef = new JLabel("coef " + nombre(e.coef));
+        coef.setFont(Theme.FONT_PETIT);
+        coef.setForeground(Theme.TEXT_DISCRET);
+        coef.setBorder(new EmptyBorder(0, 6, 0, 4));
+        JButton modif = Theme.boutonIcone(Theme.Icone.CRAYON, "Modifier", Theme.ACCENT);
+        modif.addActionListener(x -> modifier(e));
+        JButton suppr = Theme.boutonIcone(Theme.Icone.CROIX, "Supprimer", Theme.RETARD);
+        suppr.addActionListener(x -> supprimer(e));
+        droite.add(note);
+        droite.add(coef);
+        droite.add(modif);
+        droite.add(suppr);
+
+        l.add(nom, BorderLayout.CENTER);
+        l.add(droite, BorderLayout.EAST);
+        return l;
+    }
+
+    // ---------------------------------------------------------------------
+    // Rafraîchissement (lecture du fichier local : instantané)
+    // ---------------------------------------------------------------------
+    static void rafraichir() {
+        if (fenetre == null || grilleUe == null) return;
+        List<Evaluation> evals = Stockage.visibles();
+        Programme.Resultat r = Programme.calculer(evals);
+
+        Double gen = r.generale();
+        valeurGenerale.setText(moyenne(gen));
+        valeurGenerale.setForeground(gen == null ? Theme.TEXT_DISCRET : Theme.couleurMoyenne(gen));
+        barreGenerale.changer(gen == null ? 0 : gen / 20, gen == null ? Theme.BORDER : Theme.couleurMoyenne(gen));
+        pastilleStatut.changer(r.statut().libelle, couleurStatut(r.statut()));
+        long nbUe = r.moyennesUe().values().stream().filter(v -> v != null).count();
+        detailGenerale.setText(r.nbEvaluations() + " évaluation" + (r.nbEvaluations() > 1 ? "s" : "")
+                + "  ·  " + nbUe + "/" + Programme.UES.size() + " UE calculées");
+
+        grilleUe.removeAll();
+        for (Programme.Ue ue : Programme.UES) grilleUe.add(tuileUe(ue, r));
+
+        Map<String, List<Evaluation>> parMatiere = new HashMap<>();
+        for (Evaluation e : evals) parMatiere.computeIfAbsent(e.code, k -> new ArrayList<>()).add(e);
+        remplacer(listeRessources, lignesMatieres(Programme.RESSOURCES, parMatiere, r));
+        remplacer(listeSaes, lignesMatieres(Programme.SAES, parMatiere, r));
+
+        majSynchro();
+        fenetre.getContentPane().revalidate();
+        fenetre.getContentPane().repaint();
+    }
+
+    static void remplacer(JPanel conteneur, JComponent contenu) {
+        conteneur.removeAll();
+        conteneur.add(contenu, BorderLayout.CENTER);
+    }
+
+    /** Pastille d'état de la synchronisation, en haut à droite. */
+    static void majSynchro() {
+        if (pastilleSynchro == null) return;
+        int attente = Stockage.enAttente();
+        switch (Bdd.etat()) {
+            case LOCAL -> {
+                pastilleSynchro.changer("Enregistré sur cet ordinateur", Theme.TEXT_DISCRET);
+                pastilleSynchro.setToolTipText("Aucune base de données configurée (Paramètres) : tout reste sur cet ordinateur.");
+            }
+            case EN_LIGNE -> {
+                pastilleSynchro.changer(attente == 0 ? "●  Synchronisé" : "●  Envoi de " + attente + " changement(s)…",
+                        attente == 0 ? Theme.SUCCES : Theme.ACCENT);
+                pastilleSynchro.setToolTipText("Base de données joignable. Clique pour synchroniser maintenant.");
+            }
+            case HORS_LIGNE -> {
+                pastilleSynchro.changer("●  Hors ligne" + (attente > 0 ? " · " + attente + " en attente" : ""), Theme.ATTENTION);
+                pastilleSynchro.setToolTipText("<html>Base de données injoignable : les notes sont enregistrées sur cet ordinateur<br>"
+                        + "et seront envoyées automatiquement au retour de la connexion. Clique pour réessayer.</html>");
+            }
+            default -> {
+                pastilleSynchro.changer("●  Connexion…", Theme.TEXT_DISCRET);
+                pastilleSynchro.setToolTipText("Connexion à la base de données en cours.");
+            }
+        }
+    }
+
+    // =====================================================================
+    // FENÊTRE
+    // =====================================================================
+    public static void main(String[] args) {
         Theme.installer();
 
-        // La fenêtre est construite sur le fil d'affichage de Swing (obligatoire quand Main.java l'ouvre)
+        // L'affichage vient du fichier local : la fenêtre s'ouvre tout de suite, BDD ou pas
         SwingUtilities.invokeLater(() -> {
-            JFrame frame = new JFrame("Centrale Étudiant · Notes");
-            frame.setSize(1000, 800);
-            frame.setDefaultCloseOperation(fermeture);
-            fenetre = frame;
-            frame.getContentPane().setBackground(Theme.BACKGROUND);
-
-            JPanel entete = Theme.entete("Notes et moyennes",
-                    Theme.info("Clique sur une note pour la sélectionner · double-clique sur une matière pour la modifier"));
-
-            DefaultTableModel tableUnClickable = new DefaultTableModel(donneesInitiales, colonnesInitiales) {
-                @Override
-                public boolean isCellEditable(int row, int column) {
-                    return false;
-                }
-            };
-
-            tableNote = new JTable(tableUnClickable);
-            styleTable(tableNote);
-            tableNote.setCellSelectionEnabled(true); // on clique sur la case d'une note
-            doubleClicMatiere(tableNote, true);
-
-            JScrollPane scroll = new JScrollPane(tableNote);
-
-            labelGenerale = new JLabel(" ");
-            labelGenerale.setFont(Theme.FONT_SECTION);
-            labelGenerale.setBorder(new EmptyBorder(0, 4, 8, 0));
-
-            tableMoyenne = new JTable(modeleMoyennes());
-            styleTable(tableMoyenne);
-            doubleClicMatiere(tableMoyenne, false);
-
-            JScrollPane scrollMoyenne = new JScrollPane(tableMoyenne);
-
-            JPanel blocMoyennes = new JPanel(new BorderLayout());
-            blocMoyennes.setBackground(Theme.BACKGROUND);
-            blocMoyennes.add(labelGenerale, BorderLayout.NORTH);
-            blocMoyennes.add(Theme.encadrer(scrollMoyenne), BorderLayout.CENTER);
-
-            JPanel tablesPanel = new JPanel(new GridLayout(2, 1, 0, 16));
-            tablesPanel.setBackground(Theme.BACKGROUND);
-            tablesPanel.setBorder(new EmptyBorder(0, 24, 0, 24));
-            tablesPanel.add(Theme.encadrer(scroll));
-            tablesPanel.add(blocMoyennes);
-
-            JButton btnNote = themedButton("Ajouter Une Note");
-            btnNote.addActionListener(e -> AddNote());
-
-            JButton btnDeleteNote = Theme.boutonSecondaire("Supprimer la note sélectionnée");
-            btnDeleteNote.addActionListener(e -> DeleteNote());
-
-            JButton btnMatiere = Theme.boutonSecondaire("Ajouter Une Matière");
-            btnMatiere.addActionListener(e -> AddMatiere());
-
-            JPanel btnSurround = new JPanel();
-            btnSurround.setBackground(Theme.BACKGROUND);
-            btnSurround.setBorder(new EmptyBorder(16, 0, 16, 0));
-            btnSurround.add(btnNote);
-            btnSurround.add(btnDeleteNote);
-            btnSurround.add(btnMatiere);
-
-            JPanel panel = new JPanel(new BorderLayout());
-            panel.setBackground(Theme.BACKGROUND);
-            panel.add(entete, BorderLayout.NORTH);
-            panel.add(tablesPanel, BorderLayout.CENTER);
-            panel.add(btnSurround, BorderLayout.SOUTH);
-
-            frame.getContentPane().add(panel);
+            JFrame frame = construireFenetre();
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
+
+            if (!Stockage.nonMigrees.isEmpty()) {
+                bandeau.montrer("Matières de l'ancienne version non rattachées : " + String.join(", ", Stockage.nonMigrees)
+                        + " (gardées dans notes_backup.csv)", Theme.ATTENTION, null, null);
+            }
+
+            // Synchronisation en arrière-plan : la fenêtre est déjà utilisable
+            Bdd.planifier(Database::synchroniser, Note::rafraichir);
         });
     }
 
-    static void styleTable(JTable table) {
-        Theme.styleTable(table);
+    /** Construit la fenêtre des notes (sans l'afficher). */
+    static JFrame construireFenetre() {
+        JFrame frame = new JFrame("Centrale Étudiant · Notes");
+        frame.setSize(1180, 880);
+        frame.setMinimumSize(new Dimension(900, 600));
+        frame.setDefaultCloseOperation(fermeture);
+        frame.getContentPane().setBackground(Theme.BACKGROUND);
+        fenetre = frame;
+
+        pastilleSynchro = new Theme.Pastille(" ", Theme.TEXT_DISCRET);
+        pastilleSynchro.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        pastilleSynchro.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) {
+                Bdd.reessayer();
+                pastilleSynchro.changer("●  Synchronisation…", Theme.ACCENT);
+                Bdd.planifier(Database::synchroniser, Note::rafraichir);
+            }
+        });
+        JPanel entete = Theme.entete("Notes et moyennes",
+                Theme.info("BUT1 Informatique · Semestre 1 · calcul officiel par UE"), pastilleSynchro);
+
+        Colonne contenu = new Colonne();
+        contenu.setBorder(new EmptyBorder(4, 24, 24, 24));
+        GridBagConstraints g = new GridBagConstraints();
+        g.gridx = 0;
+        g.gridy = 0;
+        g.weightx = 1;
+        g.fill = GridBagConstraints.BOTH;
+        g.insets = new Insets(0, 0, 16, 0);
+
+        // ligne 1 : moyenne générale + UE
+        JPanel haut = new JPanel(new GridBagLayout());
+        haut.setOpaque(false);
+        GridBagConstraints h = new GridBagConstraints();
+        h.gridy = 0;
+        h.fill = GridBagConstraints.BOTH;
+        h.weighty = 1;
+        h.gridx = 0;
+        h.weightx = 0.32;
+        h.insets = new Insets(0, 0, 0, 16);
+        JPanel generale = carteGenerale();
+        generale.setPreferredSize(new Dimension(300, 10));
+        haut.add(generale, h);
+        h.gridx = 1;
+        h.weightx = 0.68;
+        h.insets = new Insets(0, 0, 0, 0);
+        haut.add(carteUes(), h);
+        contenu.add(haut, g);
+
+        // ligne 2 : ajout
+        g.gridy++;
+        contenu.add(carteAjout(), g);
+
+        // ligne 3 : ressources | SAÉ
+        listeRessources = new JPanel(new BorderLayout());
+        listeRessources.setOpaque(false);
+        listeSaes = new JPanel(new BorderLayout());
+        listeSaes.setOpaque(false);
+        JPanel bas = new JPanel(new GridBagLayout());
+        bas.setOpaque(false);
+        GridBagConstraints b = new GridBagConstraints();
+        b.gridy = 0;
+        b.fill = GridBagConstraints.HORIZONTAL;
+        b.anchor = GridBagConstraints.NORTH;
+        b.weightx = 0.5;
+        b.weighty = 1;
+        b.gridx = 0;
+        b.insets = new Insets(0, 0, 0, 16);
+        bas.add(carteListe("Ressources", "R1.01 à R1.12 · clique sur une matière pour voir ses notes", listeRessources), b);
+        b.gridx = 1;
+        b.insets = new Insets(0, 0, 0, 0);
+        bas.add(carteListe("SAÉ", "Situations d'apprentissage et d'évaluation · 1.01 à 1.06", listeSaes), b);
+        g.gridy++;
+        g.weighty = 1;
+        g.anchor = GridBagConstraints.NORTH;
+        g.fill = GridBagConstraints.HORIZONTAL;
+        contenu.add(bas, g);
+
+        JScrollPane scroll = new JScrollPane(contenu);
+        scroll.setBorder(BorderFactory.createEmptyBorder());
+        scroll.getViewport().setBackground(Theme.BACKGROUND);
+        scroll.getVerticalScrollBar().setUnitIncrement(18);
+
+        bandeau = new Bandeau();
+
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBackground(Theme.BACKGROUND);
+        panel.add(entete, BorderLayout.NORTH);
+        panel.add(scroll, BorderLayout.CENTER);
+        panel.add(bandeau, BorderLayout.SOUTH);
+        frame.setContentPane(panel);
+
+        rafraichir();
+        Theme.auChangement(Note::rafraichir);         // infobulles HTML recolorées
+        Bdd.auChangement(Note::majSynchro);
+        return frame;
     }
 }

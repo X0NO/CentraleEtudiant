@@ -98,22 +98,37 @@ public final class Theme {
         }
     }
 
-    static final Color BACKGROUND      = new Couleur(0x161622, 0xF2F3F7);
-    static final Color SURFACE         = new Couleur(0x1F1F2E, 0xFFFFFF);
-    static final Color SURFACE_ALT     = new Couleur(0x262638, 0xF6F7FA);
-    static final Color SURFACE_HOVER   = new Couleur(0x2F2F46, 0xECEEF4);
-    static final Color BORDER          = new Couleur(0x34344A, 0xE0E2EA);
-    static final Color GRILLE_LEGERE   = new Couleur(0x2A2A3D, 0xEFF0F4);
-    static final Color TEXT_PRIMARY    = new Couleur(0xE6E6F0, 0x1E2130);
-    static final Color TEXT_DISCRET    = new Couleur(0x8C8CA8, 0x6A6E84);
-    static final Color ACCENT          = new Couleur(0x89B4FA, 0x3B6FE0);
-    static final Color ACCENT_HOVER    = new Couleur(0xA6C6FB, 0x2E5CC7);
-    static final Color TEXT_ON_ACCENT  = new Couleur(0x11111B, 0xFFFFFF);
-    static final Color FOND_AUJOURDHUI = new Couleur(0x222944, 0xEAF0FD);
-    static final Color SUCCES          = new Couleur(0xA6E3A1, 0x2F9E5A);
-    static final Color ATTENTION       = new Couleur(0xF9E2AF, 0xC27C0E);
-    static final Color RETARD          = new Couleur(0xF38BA8, 0xD4405E);
+    // Palette neutre et froide, accent indigo (sombre : inspirée de Linear / Raycast ; clair : blanc cassé)
+    static final Color BACKGROUND      = new Couleur(0x0F1117, 0xF5F6FA);
+    static final Color SURFACE         = new Couleur(0x171A23, 0xFFFFFF);
+    static final Color SURFACE_ALT     = new Couleur(0x1D2130, 0xF3F4F8);
+    static final Color SURFACE_HOVER   = new Couleur(0x262B3D, 0xE9EBF2);
+    static final Color BORDER          = new Couleur(0x272B38, 0xE3E5ED);
+    static final Color GRILLE_LEGERE   = new Couleur(0x1E2230, 0xEEF0F5);
+    static final Color TEXT_PRIMARY    = new Couleur(0xE8EAF0, 0x171923);
+    static final Color TEXT_DISCRET    = new Couleur(0x8B91A3, 0x6B7085);
+    static final Color ACCENT          = new Couleur(0x8B9CFF, 0x4F5BD5);
+    static final Color ACCENT_HOVER    = new Couleur(0xA5B2FF, 0x3F4AC0);
+    static final Color TEXT_ON_ACCENT  = new Couleur(0x0F1117, 0xFFFFFF);
+    static final Color FOND_AUJOURDHUI = new Couleur(0x1B2140, 0xEDEFFF);
+    static final Color SUCCES          = new Couleur(0x4ADE80, 0x16A34A);
+    static final Color ATTENTION       = new Couleur(0xFBBF24, 0xD97706);
+    static final Color RETARD          = new Couleur(0xF87171, 0xDC2626);
     static final Color ERREUR          = RETARD;
+
+    /** Version transparente d'une couleur du thème (suit aussi le mode) : fond des pastilles, halos... */
+    static Color transparent(Color base, int alpha) {
+        return new Color(0, true) {
+            @Override public int getRGB() { return (alpha << 24) | (base.getRGB() & 0xFFFFFF); }
+        };
+    }
+
+    /** Couleur d'une moyenne sur 20 : vert >= 10, orange >= 8, rouge en dessous. */
+    static Color couleurMoyenne(double m) {
+        if (m >= 10) return SUCCES;
+        if (m >= 8) return ATTENTION;
+        return RETARD;
+    }
 
     /** Couleur d'une matière (teinte 0..1) : pastel en sombre, plus soutenue en clair pour rester lisible. */
     static Color teinte(float h) {
@@ -129,7 +144,9 @@ public final class Theme {
     // =====================================================================
     static final String POLICE = FlatInterFont.FAMILY;
 
-    static final Font FONT_TITLE   = new Font(POLICE, Font.BOLD, 22);
+    static final Font FONT_TITLE   = new Font(POLICE, Font.BOLD, 24);
+    static final Font FONT_CHIFFRE = new Font(POLICE, Font.BOLD, 46);
+    static final Font FONT_CHIFFRE_MOYEN = new Font(POLICE, Font.BOLD, 22);
     static final Font FONT_SECTION = new Font(POLICE, Font.BOLD, 15);
     static final Font FONT_LABEL   = new Font(POLICE, Font.PLAIN, 14);
     static final Font FONT_BUTTON  = new Font(POLICE, Font.BOLD, 13);
@@ -215,6 +232,19 @@ public final class Theme {
         UIManager.put("Button.arc", 12);
         UIManager.put("Component.arc", 10);
         UIManager.put("TextComponent.arc", 10);
+        UIManager.put("Component.borderColor", BORDER);
+        UIManager.put("Component.focusedBorderColor", ACCENT);
+        UIManager.put("Component.focusColor", transparent(ACCENT, 90));
+        UIManager.put("ComboBox.buttonBackground", SURFACE_ALT);
+        UIManager.put("ComboBox.background", SURFACE_ALT);
+        UIManager.put("ComboBox.popupBackground", SURFACE);
+        UIManager.put("ComboBox.selectionArc", 8);
+        UIManager.put("List.selectionArc", 8);
+        UIManager.put("TextField.background", SURFACE_ALT);
+        UIManager.put("PasswordField.background", SURFACE_ALT);
+        UIManager.put("OptionPane.background", SURFACE);
+        UIManager.put("Panel.background", BACKGROUND);
+        UIManager.put("ToolTip.border", new EmptyBorder(8, 10, 8, 10));
         UIManager.put("CheckBox.arc", 6);
         UIManager.put("ScrollPane.arc", 12);
         UIManager.put("Component.focusWidth", 1);
@@ -320,6 +350,11 @@ public final class Theme {
      * infos facultatives en dessous, et le bouton de mode à droite.
      */
     static JPanel entete(String page, JComponent infos) {
+        return entete(page, infos, new JComponent[0]);
+    }
+
+    /** Même en-tête, avec des composants supplémentaires à droite (avant le bouton de mode). */
+    static JPanel entete(String page, JComponent infos, JComponent... aDroite) {
         JLabel surtitre = new JLabel("CENTRALE ÉTUDIANT");
         surtitre.setFont(FONT_SURTITRE);
         surtitre.setForeground(ACCENT);
@@ -334,8 +369,9 @@ public final class Theme {
         gauche.add(titre);
         if (infos != null) gauche.add(infos);
 
-        JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         droite.setOpaque(false);
+        for (JComponent c : aDroite) droite.add(c);
         droite.add(boutonMode());
 
         JPanel p = new JPanel(new BorderLayout());
@@ -475,5 +511,157 @@ public final class Theme {
             g.draw(forme());
             g.dispose();
         }
+    }
+
+    // =====================================================================
+    // PETITS COMPOSANTS MODERNES (pastilles, barres, titres de section)
+    // =====================================================================
+
+    /** Pastille arrondie : texte coloré sur fond de la même couleur, très transparent. */
+    static final class Pastille extends JLabel {
+        private Color couleur;
+
+        Pastille(String texte, Color couleur) {
+            super(texte);
+            setFont(FONT_SURTITRE.deriveFont(12f));
+            setBorder(new EmptyBorder(4, 10, 4, 10));
+            setOpaque(false);
+            changer(texte, couleur);
+        }
+
+        void changer(String texte, Color c) {
+            couleur = c;
+            setText(texte);
+            setForeground(c);
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int h = getHeight();
+            g.setColor(transparent(couleur, 38));
+            g.fill(new RoundRectangle2D.Double(0, 0, getWidth() - 1, h - 1, h, h));
+            g.setColor(transparent(couleur, 70));
+            g.draw(new RoundRectangle2D.Double(0.5, 0.5, getWidth() - 2, h - 2, h, h));
+            g.dispose();
+            super.paintComponent(g0);
+        }
+    }
+
+    /** Barre de progression arrondie (ex : moyenne sur 20). */
+    static final class Barre extends JComponent {
+        private double ratio;
+        private Color couleur;
+        private final int epaisseur;
+
+        Barre(double ratio, Color couleur) {
+            this(ratio, couleur, 6);
+        }
+
+        Barre(double ratio, Color couleur, int epaisseur) {
+            this.epaisseur = epaisseur;
+            setPreferredSize(new Dimension(90, epaisseur + 2));
+            setOpaque(false);
+            changer(ratio, couleur);
+        }
+
+        void changer(double r, Color c) {
+            ratio = Double.isNaN(r) ? 0 : Math.max(0, Math.min(1, r));
+            couleur = c;
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int h = epaisseur, y = (getHeight() - h) / 2;
+            g.setColor(BORDER);
+            g.fill(new RoundRectangle2D.Double(0, y, getWidth(), h, h, h));
+            if (ratio > 0) {
+                g.setColor(couleur);
+                g.fill(new RoundRectangle2D.Double(0, y, Math.max(h, getWidth() * ratio), h, h, h));
+            }
+            g.dispose();
+        }
+    }
+
+    /** Petit titre de section en majuscules discrètes (« UNITÉS D'ENSEIGNEMENT »). */
+    static JLabel surtitre(String texte) {
+        JLabel l = new JLabel(texte.toUpperCase());
+        l.setFont(FONT_SURTITRE);
+        l.setForeground(TEXT_DISCRET);
+        return l;
+    }
+
+    /** Carte : panneau arrondi de surface, avec marge intérieure. */
+    static PanneauArrondi carte(LayoutManager layout, int marge) {
+        PanneauArrondi p = new PanneauArrondi(layout, 18);
+        p.setBackground(SURFACE);
+        p.setBorder(new EmptyBorder(marge, marge, marge, marge));
+        return p;
+    }
+
+    /** Petites icônes vectorielles (la police Inter n'a pas ▸ ▾ ✎) : dessinées avec la couleur du composant. */
+    enum Icone implements Icon {
+        CHEVRON_DROITE, CHEVRON_BAS, CRAYON, CROIX;
+
+        @Override public int getIconWidth() { return 14; }
+        @Override public int getIconHeight() { return 14; }
+
+        @Override
+        public void paintIcon(Component c, Graphics g0, int x, int y) {
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
+            g.translate(x, y);
+            g.setColor(c.getForeground());
+            g.setStroke(new BasicStroke(1.7f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            switch (this) {
+                case CHEVRON_DROITE -> {
+                    g.draw(new Line2D.Double(5.5, 3.5, 9.5, 7));
+                    g.draw(new Line2D.Double(9.5, 7, 5.5, 10.5));
+                }
+                case CHEVRON_BAS -> {
+                    g.draw(new Line2D.Double(3.5, 5.5, 7, 9.5));
+                    g.draw(new Line2D.Double(7, 9.5, 10.5, 5.5));
+                }
+                case CRAYON -> {
+                    java.awt.geom.Path2D.Double p = new java.awt.geom.Path2D.Double();
+                    p.moveTo(9.3, 2.4);
+                    p.lineTo(11.6, 4.7);
+                    p.lineTo(5, 11.3);
+                    p.lineTo(2.3, 11.7);
+                    p.lineTo(2.7, 9);
+                    p.closePath();
+                    g.draw(p);
+                    g.draw(new Line2D.Double(8, 3.7, 10.3, 6));
+                }
+                case CROIX -> {
+                    g.draw(new Line2D.Double(3.5, 3.5, 10.5, 10.5));
+                    g.draw(new Line2D.Double(10.5, 3.5, 3.5, 10.5));
+                }
+            }
+            g.dispose();
+        }
+    }
+
+    /** Bouton discret sans fond, avec une icône, coloré au survol. */
+    static JButton boutonIcone(Icon icone, String infobulle, Color survol) {
+        JButton b = new JButton(icone);
+        b.setForeground(TEXT_DISCRET);
+        b.setContentAreaFilled(false);
+        b.setBorderPainted(false);
+        b.setFocusPainted(false);
+        b.setBorder(new EmptyBorder(4, 6, 4, 6));
+        b.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        b.setToolTipText(infobulle);
+        b.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) { b.setForeground(survol); }
+            @Override public void mouseExited(MouseEvent e) { b.setForeground(TEXT_DISCRET); }
+        });
+        return b;
     }
 }

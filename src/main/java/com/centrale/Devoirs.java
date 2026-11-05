@@ -18,7 +18,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -31,7 +30,6 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -97,6 +95,10 @@ public class Devoirs {
             this.description = description;
             this.fait = fait;
             this.statut = statut;
+        }
+
+        Devoir copie() {
+            return new Devoir(uid, matiere, pourLe, description, fait, statut);
         }
 
         String toLine() {
@@ -246,125 +248,78 @@ public class Devoirs {
             return res;
         }
 
-        // ---------- Comparaison / synchronisation au retour en ligne ----------
+        // ---------- Synchronisation (appelée en arrière-plan, voir Database.synchroniser) ----------
 
-        static synchronized void reconcilier() {
-            List<Devoir> l = lire();
-
-            boolean enAttente = false;
-            for (Devoir e : l) {
-                if (!e.statut.equals(SYNC)) { enAttente = true; break; }
-            }
-
-            if (enAttente) {
-                boolean toutOk = true;
-                Iterator<Devoir> it = l.iterator();
-                while (it.hasNext()) {
-                    Devoir e = it.next();
-                    switch (e.statut) {
-                        case ADD -> {
-                            if (DevoirDAO.inserer(e)) e.statut = SYNC; else toutOk = false;
-                        }
-                        case MOD -> {
-                            if (DevoirDAO.changerFait(e.uid, e.fait) >= 0) e.statut = SYNC; else toutOk = false;
-                        }
-                        case DEL -> {
-                            if (DevoirDAO.supprimer(e.uid) >= 0) it.remove(); else toutOk = false;
-                        }
-                        default -> { }
-                    }
-                }
-
-                // On enregistre ce qui a pu être envoyé ; le reste reste en attente
-                ecrire(l);
-                if (!toutOk) return; // on ne touche pas au CSV tant que la BDD n'est pas à jour
-            }
-
-            // Plus rien en attente : le CSV est réaligné sur la BDD
-            reconstruireDepuisBD();
+        static synchronized List<Devoir> copiesEnAttente() {
+            List<Devoir> res = new ArrayList<>();
+            for (Devoir d : lire()) if (!d.statut.equals(SYNC)) res.add(d.copie());
+            return res;
         }
 
-        /** Réécrit le CSV à partir de la BDD. Si la lecture BDD échoue, le CSV existant n'est pas touché. */
-        static synchronized void reconstruireDepuisBD() {
-            String sql = "SELECT uid, matiere, date_rendu, fait, description FROM devoirs ORDER BY date_rendu, id";
-            List<Devoir> l = new ArrayList<>();
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql);
-                 ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    l.add(new Devoir(rs.getString("uid"), rs.getString("matiere"),
-                            rs.getObject("date_rendu", LocalDate.class), rs.getString("description"),
-                            rs.getBoolean("fait"), SYNC));
-                }
-            } catch (SQLException e) {
-                System.err.println("Lecture BDD impossible, CSV conservé tel quel : " + e.getMessage());
-                return;
+        /**
+         * Le fichier devient le contenu de la BDD, plus les changements locaux pas encore envoyés
+         * (échec d'envoi, ou faits pendant la synchronisation).
+         * @param envoyes uid -> ligne envoyée avec succès
+         */
+        static synchronized void fusionner(List<Devoir> distants, Map<String, String> envoyes) {
+            Map<String, Devoir> res = new LinkedHashMap<>();
+            for (Devoir d : distants) res.put(d.uid, d);
+            for (Devoir l : lire()) {
+                String envoye = envoyes.get(l.uid);
+                boolean changePendant = envoye != null && !envoye.equals(l.toLine());
+                if (l.statut.equals(SYNC) && !changePendant) continue;
+                if (envoye != null && !changePendant) continue;
+                if (l.statut.equals(SYNC)) l.statut = MOD;
+                res.put(l.uid, l);
             }
-            ecrire(l);
+            ecrire(new ArrayList<>(res.values()));
         }
     }
 
     // =====================================================================
-    // ACCÈS BASE DE DONNÉES
+    // ACCÈS BASE DE DONNÉES (une connexion par synchronisation, toujours hors de l'interface)
     // =====================================================================
     static final class Database {
 
         /** true une fois la table vérifiée/créée. */
-        static boolean schemaPret = false;
+        static volatile boolean schemaPret = false;
 
-        static Connection getConnection() throws SQLException {
-            if (!Config.bddConfiguree()) throw new SQLException("Aucune base de données configurée (mode local)");
-            return DriverManager.getConnection(Config.get(Config.DB_URL), Config.get(Config.DB_USER), Config.get(Config.DB_PASSWORD));
-        }
-
-        /** true si la BDD répond. */
-        static boolean ping() {
-            try (Connection conn = getConnection()) {
-                return true;
-            } catch (SQLException e) {
-                return false;
+        static void creerTables(Connection c) throws SQLException {
+            try (Statement stmt = c.createStatement()) {
+                stmt.execute("CREATE TABLE IF NOT EXISTS devoirs (" +
+                        "id SERIAL PRIMARY KEY," +
+                        "uid VARCHAR(36) NOT NULL UNIQUE," +
+                        "matiere VARCHAR(100) NOT NULL," +
+                        "date_rendu DATE NOT NULL," +
+                        "fait BOOLEAN NOT NULL DEFAULT FALSE," +
+                        "description TEXT NOT NULL," +
+                        "date_creation TIMESTAMP DEFAULT NOW()" +
+                        ")");
             }
+            schemaPret = true;
         }
 
-        /** Si la BDD est joignable : compare BDD et CSV, et aligne l'un sur l'autre (voir DevoirCsv). */
-        static void synchroniser() {
-            if (!ping()) return;
-            if (!schemaPret) creerTables(); // appli lancée hors-ligne : on prépare la BDD dès son retour
-            try {
-                DevoirCsv.reconcilier();
-            } catch (Exception e) {
-                System.err.println("Synchronisation BDD/CSV impossible : " + e.getMessage());
-            }
-        }
-
-        static boolean connecter() {
-            try (Connection conn = getConnection()) {
-                System.out.println("Connexion à la base de données réussie !");
-                return true;
+        /**
+         * Envoie les changements locaux (ajouts, cases cochées, suppressions), puis aligne le CSV sur la BDD.
+         * Immédiat si la BDD n'est pas configurée ou vient d'échouer. À lancer via Bdd.planifier(...).
+         */
+        static synchronized void synchroniser() {
+            if (!Bdd.disponible()) return;
+            try (Connection c = Bdd.connexion()) {
+                if (!schemaPret) creerTables(c);
+                Map<String, String> envoyes = new HashMap<>();
+                for (Devoir d : DevoirCsv.copiesEnAttente()) {
+                    try {
+                        if (d.statut.equals(DevoirCsv.DEL)) DevoirDAO.supprimer(c, d.uid);
+                        else DevoirDAO.enregistrer(c, d);
+                        envoyes.put(d.uid, d.toLine());
+                    } catch (SQLException e) {
+                        System.err.println("Envoi du devoir " + d.uid + " impossible : " + e.getMessage());
+                    }
+                }
+                DevoirCsv.fusionner(DevoirDAO.lireTout(c), envoyes);
             } catch (SQLException e) {
-                System.err.println("Base de données injoignable, mode local : " + e.getMessage());
-                return false;
-            }
-        }
-
-        static void creerTables() {
-            String sqlDevoirs = "CREATE TABLE IF NOT EXISTS devoirs (" +
-                    "id SERIAL PRIMARY KEY," +
-                    "uid VARCHAR(36) NOT NULL UNIQUE," +
-                    "matiere VARCHAR(100) NOT NULL," +
-                    "date_rendu DATE NOT NULL," +
-                    "fait BOOLEAN NOT NULL DEFAULT FALSE," +
-                    "description TEXT NOT NULL," +
-                    "date_creation TIMESTAMP DEFAULT NOW()" +
-                    ")";
-
-            try (Connection conn = getConnection();
-                 Statement stmt = conn.createStatement()) {
-                stmt.execute(sqlDevoirs);
-                System.out.println("Table 'devoirs' prête.");
-                schemaPret = true;
-            } catch (SQLException e) {
-                e.printStackTrace();
+                System.err.println("BDD injoignable, devoirs gardés sur cet ordinateur : " + e.getMessage());
             }
         }
     }
@@ -374,50 +329,40 @@ public class Devoirs {
     // =====================================================================
     static final class DevoirDAO {
 
-        /** Insère le devoir (déjà présent avec le même uid = rien à faire, considéré comme réussi). */
-        static boolean inserer(Devoir d) {
+        /** Ajoute le devoir, ou le met à jour s'il existe déjà (même uid). */
+        static void enregistrer(Connection c, Devoir d) throws SQLException {
             String sql = "INSERT INTO devoirs (uid, matiere, date_rendu, fait, description) VALUES (?, ?, ?, ?, ?) "
-                       + "ON CONFLICT (uid) DO NOTHING";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
+                       + "ON CONFLICT (uid) DO UPDATE SET matiere = EXCLUDED.matiere, date_rendu = EXCLUDED.date_rendu, "
+                       + "fait = EXCLUDED.fait, description = EXCLUDED.description";
+            try (PreparedStatement stmt = c.prepareStatement(sql)) {
                 stmt.setString(1, d.uid);
                 stmt.setString(2, d.matiere);
                 stmt.setObject(3, d.pourLe);
                 stmt.setBoolean(4, d.fait);
                 stmt.setString(5, d.description);
                 stmt.executeUpdate();
-                return true;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return false;
             }
         }
 
-        /** @return nombre de lignes modifiées (0 = devoir absent de la BDD), -1 = erreur (BDD injoignable) */
-        static int changerFait(String uid, boolean fait) {
-            String sql = "UPDATE devoirs SET fait = ? WHERE uid = ?";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setBoolean(1, fait);
-                stmt.setString(2, uid);
-                return stmt.executeUpdate();
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return -1;
-            }
-        }
-
-        /** @return 1 = supprimé, 0 = introuvable en BDD, -1 = erreur (BDD injoignable) */
-        static int supprimer(String uid) {
-            String sql = "DELETE FROM devoirs WHERE uid = ?";
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
+        static void supprimer(Connection c, String uid) throws SQLException {
+            try (PreparedStatement stmt = c.prepareStatement("DELETE FROM devoirs WHERE uid = ?")) {
                 stmt.setString(1, uid);
-                return stmt.executeUpdate() > 0 ? 1 : 0;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                return -1;
+                stmt.executeUpdate();
             }
+        }
+
+        static List<Devoir> lireTout(Connection c) throws SQLException {
+            List<Devoir> l = new ArrayList<>();
+            try (PreparedStatement stmt = c.prepareStatement(
+                    "SELECT uid, matiere, date_rendu, fait, description FROM devoirs ORDER BY date_rendu, id");
+                 ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    l.add(new Devoir(rs.getString("uid"), rs.getString("matiere"),
+                            rs.getObject("date_rendu", LocalDate.class), rs.getString("description"),
+                            rs.getBoolean("fait"), DevoirCsv.SYNC));
+                }
+            }
+            return l;
         }
     }
 
@@ -589,15 +534,9 @@ public class Devoirs {
         fait.setFocusPainted(false);
         fait.setCursor(new Cursor(Cursor.HAND_CURSOR));
         fait.addActionListener(e -> {
-            boolean coche = fait.isSelected();
-
-            // Remet d'abord BDD et CSV d'accord si la BDD vient de revenir
-            Database.synchroniser();
-
-            // BDD puis CSV en même temps (statut MOD si la BDD est injoignable)
-            boolean dbOk = Database.ping() && DevoirDAO.changerFait(d.uid, coche) >= 0;
-            DevoirCsv.changerFait(d.uid, coche, dbOk);
-            SwingUtilities.invokeLater(Devoirs::rafraichirListe);
+            // CSV tout de suite (affichage instantané), BDD ensuite en arrière-plan
+            DevoirCsv.changerFait(d.uid, fait.isSelected(), false);
+            SwingUtilities.invokeLater(Devoirs::apresChangement);
         });
 
         JButton supprimer = new JButton("×");
@@ -619,19 +558,8 @@ public class Devoirs {
                     "Supprimer le devoir de " + d.matiere + " ?", "Supprimer", JOptionPane.YES_NO_OPTION);
             if (choix != JOptionPane.YES_OPTION) return;
 
-            Database.synchroniser();
-
-            // 1) BDD : 1 = supprimé, 0 = introuvable, -1 = BDD injoignable
-            int res = Database.ping() ? DevoirDAO.supprimer(d.uid) : -1;
-
-            // 2) CSV local : mis à jour en même temps, dans tous les cas
-            boolean dbOk = (res >= 0);
-            DevoirCsv.supprimer(d.uid, dbOk);
-
-            if (!dbOk && Config.bddConfiguree()) {
-                JOptionPane.showMessageDialog(SwingUtilities.getWindowAncestor(liste), "Connexion BDD indisponible. Le devoir a été supprimé du fichier local.\nIl sera supprimé de la BDD dès la reconnexion.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-            }
-            rafraichirListe();
+            DevoirCsv.supprimer(d.uid, false);
+            apresChangement();
         });
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
@@ -666,16 +594,15 @@ public class Devoirs {
         }
     }
 
-    /** Matières proposées : celles des notes (notes_backup.csv) + celles déjà utilisées dans les devoirs. */
+    /** Matières proposées : celles déjà utilisées dans les devoirs, puis celles du programme du BUT. */
     static List<String> matieresConnues() {
         List<String> noms = new ArrayList<>();
-        try {
-            noms.addAll(Note.CsvMirror.listerMatieres());
-        } catch (Exception | ExceptionInInitializerError e) {
-            // pas de fichier de notes ou .env absent : on se contente des matières des devoirs
-        }
         for (Devoir d : devoirs) {
             if (!noms.contains(d.matiere)) noms.add(d.matiere);
+        }
+        for (Programme.Matiere m : Programme.TOUTES) {
+            String nom = m.code() + " " + m.nom();
+            if (!noms.contains(nom)) noms.add(nom);
         }
         return noms;
     }
@@ -768,20 +695,10 @@ public class Devoirs {
 
             Devoir nouveau = new Devoir(UUID.randomUUID().toString(), matiere, pourLe, consigne, false, DevoirCsv.ADD);
 
-            // Remet d'abord BDD et CSV d'accord si la BDD vient de revenir
-            Database.synchroniser();
-
-            // tentative d'insertion BDD, puis CSV en même temps
-            // (statut SYNC si la BDD a accepté le devoir, ADD s'il reste à envoyer)
-            boolean insertionOk = Database.ping() && DevoirDAO.inserer(nouveau);
-            DevoirCsv.ajouter(nouveau, insertionOk);
-
-            if (!insertionOk && Config.bddConfiguree()) {
-                JOptionPane.showMessageDialog(addDevoirFrame, "Connexion BDD indisponible. Le devoir a été sauvegardé dans le fichier local (CSV).\nIl sera envoyé à la BDD dès la reconnexion.", "Mode Hors-Ligne", JOptionPane.INFORMATION_MESSAGE);
-            }
-
-            rafraichirListe();
+            // CSV tout de suite (statut ADD), envoyé à la BDD en arrière-plan
+            DevoirCsv.ajouter(nouveau, false);
             addDevoirFrame.dispose();
+            apresChangement();
         });
 
         JButton annulButton = Theme.boutonSecondaire("Annuler");
@@ -811,16 +728,7 @@ public class Devoirs {
 
         Theme.installer();
 
-        // Évite de figer l'appli plusieurs secondes à chaque test si le Raspberry Pi est injoignable
-        DriverManager.setLoginTimeout(3);
-
-        if (Database.connecter()) {
-            Database.creerTables();
-        }
-
-        // Compare BDD/CSV (si en ligne) ; l'affichage est ensuite chargé depuis le CSV
-        Database.synchroniser();
-
+        // L'affichage vient du CSV : la fenêtre s'ouvre tout de suite, la BDD est synchronisée ensuite
         SwingUtilities.invokeLater(() -> {
             JFrame frame = new JFrame("Centrale Étudiant · Devoirs");
             frame.setSize(1000, 800);
@@ -865,6 +773,14 @@ public class Devoirs {
             frame.getContentPane().add(panel);
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
+            Bdd.planifier(Database::synchroniser, Devoirs::rafraichirListe);
         });
+    }
+
+    /** Après chaque modification : affichage tout de suite, BDD ensuite en arrière-plan. */
+    static void apresChangement() {
+        rafraichirListe();
+        Main.dernierRafraichissementLocal = 0; // le tableau de bord relira les devoirs
+        Bdd.planifier(Database::synchroniser, Devoirs::rafraichirListe);
     }
 }

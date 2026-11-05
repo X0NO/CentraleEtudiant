@@ -130,31 +130,6 @@ public class Main {
         }
     }
 
-    /** Barre de progression arrondie (moyenne sur 20). */
-    static final class Barre extends JComponent {
-        private final double ratio;
-        private final Color couleur;
-
-        Barre(double ratio, Color couleur) {
-            this.ratio = Math.max(0, Math.min(1, ratio));
-            this.couleur = couleur;
-            setPreferredSize(new Dimension(90, 6));
-            setOpaque(false);
-        }
-
-        @Override
-        protected void paintComponent(Graphics g0) {
-            Graphics2D g = (Graphics2D) g0.create();
-            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-            int h = 6, y = (getHeight() - h) / 2;
-            g.setColor(Theme.BORDER);
-            g.fill(new RoundRectangle2D.Double(0, y, getWidth(), h, h, h));
-            g.setColor(couleur);
-            g.fill(new RoundRectangle2D.Double(0, y, Math.max(h, getWidth() * ratio), h, h, h));
-            g.dispose();
-        }
-    }
-
     /** Contenu d'une carte qui suit la largeur du scroll (le texte est coupé au lieu de déborder). */
     static final class ListePanel extends JPanel implements Scrollable {
         ListePanel() {
@@ -470,57 +445,52 @@ public class Main {
     // =====================================================================
     // CARTE 2 : DEVOIRS URGENTS
     // =====================================================================
+    /** Affiche tout de suite les devoirs du CSV local, puis les réaffiche après la synchronisation BDD (en fond). */
     static void chargerDevoirs() {
-        new SwingWorker<List<Devoirs.Devoir>, Void>() {
-            @Override
-            protected List<Devoirs.Devoir> doInBackground() {
-                Devoirs.Database.synchroniser(); // BDD <-> CSV (si en ligne), comme dans Devoirs.java
-                return Devoirs.DevoirCsv.listerVisibles();
-            }
+        afficherDevoirs();
+        Bdd.planifier(Devoirs.Database::synchroniser, Main::afficherDevoirs);
+    }
 
-            @Override
-            protected void done() {
-                List<Devoirs.Devoir> tous;
-                try {
-                    tous = get();
-                } catch (Exception e) {
-                    carteDevoirs.message("Impossible de lire les devoirs.\n" + cause(e), Theme.RETARD);
-                    return;
-                }
-                Map<String, Color> couleurs = couleursPour(tous.stream().map(d -> d.matiere).toList());
+    static void afficherDevoirs() {
+        List<Devoirs.Devoir> tous;
+        try {
+            tous = Devoirs.DevoirCsv.listerVisibles();
+        } catch (Exception e) {
+            carteDevoirs.message("Impossible de lire les devoirs.\n" + cause(e), Theme.RETARD);
+            return;
+        }
+        Map<String, Color> couleurs = couleursPour(tous.stream().map(d -> d.matiere).toList());
 
-                LocalDate aujourdhui = LocalDate.now();
-                LocalDate limite = aujourdhui.plusDays(JOURS_URGENTS);
-                List<Devoirs.Devoir> aFaire = tous.stream().filter(d -> !d.fait).sorted(Devoirs.PAR_ECHEANCE).toList();
-                List<Devoirs.Devoir> urgents = aFaire.stream().filter(d -> !d.pourLe.isAfter(limite)).toList();
+        LocalDate aujourdhui = LocalDate.now();
+        LocalDate limite = aujourdhui.plusDays(JOURS_URGENTS);
+        List<Devoirs.Devoir> aFaire = tous.stream().filter(d -> !d.fait).sorted(Devoirs.PAR_ECHEANCE).toList();
+        List<Devoirs.Devoir> urgents = aFaire.stream().filter(d -> !d.pourLe.isAfter(limite)).toList();
 
-                if (urgents.isEmpty()) {
-                    String suite = aFaire.isEmpty() ? "Aucun devoir à faire."
-                            : "Rien d'urgent cette semaine.\nProchain devoir : " + aFaire.get(0).matiere
-                              + " pour le " + aFaire.get(0).pourLe.format(Devoirs.SAISIE);
-                    carteDevoirs.message(suite, Theme.SUCCES);
-                    return;
-                }
+        if (urgents.isEmpty()) {
+            String suite = aFaire.isEmpty() ? "Aucun devoir à faire."
+                    : "Rien d'urgent cette semaine.\nProchain devoir : " + aFaire.get(0).matiere
+                      + " pour le " + aFaire.get(0).pourLe.format(Devoirs.SAISIE);
+            carteDevoirs.message(suite, Theme.SUCCES);
+            return;
+        }
 
-                long enRetard = urgents.stream().filter(d -> d.pourLe.isBefore(aujourdhui)).count();
-                String resume = urgents.size() + " à rendre dans les " + JOURS_URGENTS + " jours"
-                        + (enRetard > 0 ? "   ·   " + enRetard + " en retard" : "");
-                JLabel enTete = label(resume, Theme.FONT_BUTTON, enRetard > 0 ? Theme.RETARD : Theme.ACCENT);
-                enTete.setBorder(new EmptyBorder(0, 2, 4, 0));
+        long enRetard = urgents.stream().filter(d -> d.pourLe.isBefore(aujourdhui)).count();
+        String resume = urgents.size() + " à rendre dans les " + JOURS_URGENTS + " jours"
+                + (enRetard > 0 ? "   ·   " + enRetard + " en retard" : "");
+        JLabel enTete = label(resume, Theme.FONT_BUTTON, enRetard > 0 ? Theme.RETARD : Theme.ACCENT);
+        enTete.setBorder(new EmptyBorder(0, 2, 4, 0));
 
-                List<JComponent> lignes = new ArrayList<>();
-                for (Devoirs.Devoir d : urgents) {
-                    Color couleur = couleurs.getOrDefault(d.matiere, Theme.ACCENT);
-                    JPanel l = ligne(couleur, Main::ouvrirDevoirs);
+        List<JComponent> lignes = new ArrayList<>();
+        for (Devoirs.Devoir d : urgents) {
+            Color couleur = couleurs.getOrDefault(d.matiere, Theme.ACCENT);
+            JPanel l = ligne(couleur, Main::ouvrirDevoirs);
 
-                    String consigne = d.description.replace("\n", " ").trim();
-                    l.add(deuxLignes(d.matiere, couleur, consigne.isEmpty() ? null : consigne), BorderLayout.CENTER);
-                    l.add(echeance(d.pourLe, aujourdhui), BorderLayout.EAST);
-                    lignes.add(l);
-                }
-                carteDevoirs.remplir(enTete, lignes);
-            }
-        }.execute();
+            String consigne = d.description.replace("\n", " ").trim();
+            l.add(deuxLignes(d.matiere, couleur, consigne.isEmpty() ? null : consigne), BorderLayout.CENTER);
+            l.add(echeance(d.pourLe, aujourdhui), BorderLayout.EAST);
+            lignes.add(l);
+        }
+        carteDevoirs.remplir(enTete, lignes);
     }
 
     /** "En retard (2 j)", "Aujourd'hui", "Demain", "Dans 4 jours" : couleur selon l'urgence. */
@@ -539,91 +509,61 @@ public class Main {
     }
 
     // =====================================================================
-    // CARTE 3 : MOYENNES PAR MATIÈRE
+    // CARTE 3 : MOYENNES (calcul BUT1 : UE coefficientées, voir Programme.java)
     // =====================================================================
-
-    /** Moyenne d'une matière (null = pas encore de note) et coefficient de la matière. */
-    record Moyenne(String matiere, Double valeur, int nbNotes, double coefficient) {}
-
     static void chargerMoyennes() {
-        new SwingWorker<List<Moyenne>, Void>() {
-            @Override
-            protected List<Moyenne> doInBackground() {
-                Note.Database.synchroniser(); // BDD <-> CSV (si en ligne), comme dans Note.java
-                List<Note.CsvMirror.Entry> entrees = Note.CsvMirror.lire();
-
-                // Même calcul que Note.calculMoyenneGenerale() : somme((note/quotient) x coef) / somme(coef) x 20
-                List<Moyenne> res = new ArrayList<>();
-                Map<String, Double> coefs = Note.CsvMirror.coefficientsMatieres();
-                for (String matiere : coefs.keySet()) {
-                    double sommePonderee = 0, sommeCoefs = 0;
-                    int nb = 0;
-                    for (Note.CsvMirror.Entry e : entrees) {
-                        if (!e.estNote() || !e.matiere.equals(matiere) || e.statut.equals(Note.CsvMirror.DEL)) continue;
-                        if (e.quotient <= 0) continue;
-                        sommePonderee += ((double) e.valeur / e.quotient) * e.coefficient;
-                        sommeCoefs += e.coefficient;
-                        nb++;
-                    }
-                    res.add(new Moyenne(matiere, sommeCoefs > 0 ? sommePonderee / sommeCoefs * 20 : null, nb, coefs.get(matiere)));
-                }
-                return res;
-            }
-
-            @Override
-            protected void done() {
-                List<Moyenne> moyennes;
-                try {
-                    moyennes = get();
-                } catch (Exception e) {
-                    carteMoyennes.message("Impossible de lire les notes.\n" + cause(e), Theme.RETARD);
-                    return;
-                }
-                if (moyennes.isEmpty()) {
-                    carteMoyennes.message("Aucune matière pour l'instant.", Theme.TEXT_DISCRET);
-                    return;
-                }
-
-                // Moyenne générale : moyennes des matières pondérées par leur coefficient (matières notées seulement)
-                double somme = 0, nb = 0;
-                for (Moyenne m : moyennes) {
-                    if (m.valeur() != null) { somme += m.valeur() * m.coefficient(); nb += m.coefficient(); }
-                }
-                JPanel enTete = new JPanel(new BorderLayout());
-                enTete.setOpaque(false);
-                enTete.setBorder(new EmptyBorder(0, 2, 6, 2));
-                enTete.add(label("Moyenne générale", Theme.FONT_BUTTON, Theme.ACCENT), BorderLayout.WEST);
-                enTete.add(label(nb > 0 ? String.format("%.2f / 20", somme / nb) : "—",
-                        Theme.FONT_SECTION, nb > 0 ? couleurMoyenne(somme / nb) : Theme.TEXT_DISCRET), BorderLayout.EAST);
-
-                List<JComponent> lignes = new ArrayList<>();
-                for (Moyenne m : moyennes) {
-                    Color couleur = (m.valeur() == null) ? Theme.BORDER : couleurMoyenne(m.valeur());
-                    JPanel l = ligne(couleur, Main::ouvrirNotes);
-                    l.add(deuxLignes(m.matiere(), Theme.TEXT_PRIMARY,
-                            m.nbNotes() + " note" + (m.nbNotes() > 1 ? "s" : "")
-                            + "  ·  coef " + Note.formatCoef(m.coefficient())), BorderLayout.CENTER);
-
-                    JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
-                    droite.setOpaque(false);
-                    if (m.valeur() != null) droite.add(new Barre(m.valeur() / 20.0, couleur));
-                    JLabel valeur = label(m.valeur() == null ? "—" : String.format("%.2f", m.valeur()),
-                            Theme.FONT_BUTTON.deriveFont(14f), m.valeur() == null ? Theme.TEXT_DISCRET : couleur);
-                    valeur.setHorizontalAlignment(SwingConstants.RIGHT);
-                    valeur.setPreferredSize(new Dimension(44, valeur.getPreferredSize().height));
-                    droite.add(valeur);
-                    l.add(droite, BorderLayout.EAST);
-                    lignes.add(l);
-                }
-                carteMoyennes.remplir(enTete, lignes);
-            }
-        }.execute();
+        afficherMoyennes();
+        Bdd.planifier(Note.Database::synchroniser, Main::afficherMoyennes);
     }
 
-    static Color couleurMoyenne(double m) {
-        if (m >= 10) return Theme.SUCCES;
-        if (m >= 8) return Theme.ATTENTION;
-        return Theme.RETARD;
+    static void afficherMoyennes() {
+        Programme.Resultat r;
+        try {
+            r = Note.resultat();
+        } catch (Exception e) {
+            carteMoyennes.message("Impossible de lire les notes.\n" + cause(e), Theme.RETARD);
+            return;
+        }
+        if (r.nbEvaluations() == 0) {
+            carteMoyennes.message("Aucune note pour l'instant.\nAjoute-les dans « Mes notes ».", Theme.TEXT_DISCRET);
+            return;
+        }
+
+        // En-tête : moyenne générale (moyenne des UE) + statut du semestre
+        Double g = r.generale();
+        JPanel enTete = new JPanel(new BorderLayout(10, 0));
+        enTete.setOpaque(false);
+        enTete.setBorder(new EmptyBorder(0, 2, 8, 2));
+        JPanel gauche = new JPanel(new GridLayout(2, 1, 0, 2));
+        gauche.setOpaque(false);
+        gauche.add(label("Moyenne générale", Theme.FONT_BUTTON, Theme.TEXT_DISCRET));
+        JPanel statut = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        statut.setOpaque(false);
+        statut.add(new Theme.Pastille(r.statut().libelle, Note.couleurStatut(r.statut())));
+        gauche.add(statut);
+        JLabel valeur = label(Note.moyenne(g), Theme.FONT_CHIFFRE_MOYEN.deriveFont(28f),
+                g == null ? Theme.TEXT_DISCRET : Theme.couleurMoyenne(g));
+        enTete.add(gauche, BorderLayout.CENTER);
+        enTete.add(valeur, BorderLayout.EAST);
+
+        List<JComponent> lignes = new ArrayList<>();
+        for (Programme.Ue ue : Programme.UES) {
+            Double m = r.moyennesUe().get(ue.code());
+            Color couleur = (m == null) ? Theme.BORDER : Theme.couleurMoyenne(m);
+            JPanel l = ligne(couleur, Main::ouvrirNotes);
+            l.add(deuxLignes(ue.code(), Theme.TEXT_PRIMARY, ue.nom()), BorderLayout.CENTER);
+
+            JPanel droite = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+            droite.setOpaque(false);
+            if (m != null) droite.add(new Theme.Barre(m / 20.0, couleur));
+            JLabel v = label(Note.moyenne(m), Theme.FONT_BUTTON.deriveFont(14f), m == null ? Theme.TEXT_DISCRET : couleur);
+            v.setHorizontalAlignment(SwingConstants.RIGHT);
+            v.setPreferredSize(new Dimension(48, v.getPreferredSize().height));
+            droite.add(v);
+            l.add(droite, BorderLayout.EAST);
+            lignes.add(l);
+        }
+        carteMoyennes.remplir(enTete, lignes);
     }
 
     // =====================================================================
@@ -794,9 +734,6 @@ public class Main {
     public static void main(String[] args) {
 
         Theme.installer();
-
-        // Évite de figer l'appli plusieurs secondes si le Raspberry Pi est injoignable
-        java.sql.DriverManager.setLoginTimeout(3);
 
         // Les programmes ouverts depuis le tableau de bord ferment seulement leur fenêtre
         Note.fermeture = JFrame.DISPOSE_ON_CLOSE;
