@@ -69,6 +69,8 @@ import com.formdev.flatlaf.FlatClientProperties;
  * - Chaque évaluation : nom (DS1, TP noté...), note, barème (sur 20, sur 30...), coefficient.
  * - Enregistrement instantané dans evaluations.csv ; la BDD (facultative) est synchronisée
  *   en arrière-plan, sans jamais faire attendre l'interface (voir {@link Bdd}).
+ * - Si le classement est configuré (RANKING_* dans config.properties), chaque ajout, modification
+ *   ou suppression est aussi envoyé au classement, en arrière-plan (voir {@link RankingSync}).
  */
 public class Note {
 
@@ -417,6 +419,15 @@ public class Note {
          * À appeler hors de l'interface : via Bdd.planifier(...).
          */
         static synchronized void synchroniser() {
+            try {
+                synchroniserBdd();
+            } finally {
+                // la BDD a pu apporter des notes saisies sur un autre ordinateur : le classement suit
+                RankingSync.demander();
+            }
+        }
+
+        private static void synchroniserBdd() {
             for (int passe = 0; passe < 3 && Bdd.disponible(); passe++) {
                 try (Connection c = Bdd.connexion()) {
                     if (!schemaPret) creerTables(c);
@@ -494,7 +505,7 @@ public class Note {
 
     // éléments mis à jour par rafraichir()
     static JLabel valeurGenerale, detailGenerale;
-    static Theme.Pastille pastilleStatut, pastilleSynchro;
+    static Theme.Pastille pastilleStatut, pastilleSynchro, pastilleClassement;
     static Theme.Barre barreGenerale;
     static JPanel grilleUe, listeRessources, listeSaes;
     static Bandeau bandeau;
@@ -755,9 +766,10 @@ public class Note {
                 });
     }
 
-    /** Après chaque modification : affichage tout de suite, BDD ensuite en arrière-plan. */
+    /** Après chaque modification : affichage tout de suite, classement et BDD ensuite en arrière-plan. */
     static void apresChangement() {
         rafraichir();
+        RankingSync.demander();
         Bdd.planifier(Database::synchroniser, Note::rafraichir);
     }
 
@@ -1119,6 +1131,7 @@ public class Note {
         remplacer(listeSaes, lignesMatieres(Programme.SAES, parMatiere, r));
 
         majSynchro();
+        majClassement();
         fenetre.getContentPane().revalidate();
         fenetre.getContentPane().repaint();
     }
@@ -1152,6 +1165,49 @@ public class Note {
                 pastilleSynchro.setToolTipText("Connexion à la base de données en cours.");
             }
         }
+    }
+
+    /** Pastille d'état de l'envoi au classement (cachée si le classement n'est pas configuré). */
+    static void majClassement() {
+        if (pastilleClassement == null) return;
+        RankingSync r = RankingSync.appli();
+        pastilleClassement.setVisible(r.actif());
+        if (!r.actif()) return;
+        String detail = "";
+        switch (r.etat()) {
+            case A_JOUR -> pastilleClassement.changer("●  Classement à jour", Theme.SUCCES);
+            case EN_COURS -> pastilleClassement.changer("●  Classement : envoi…", Theme.ACCENT);
+            case HORS_LIGNE -> {
+                pastilleClassement.changer("●  Classement hors ligne", Theme.ATTENTION);
+                detail = "Serveur injoignable : les notes seront envoyées automatiquement au retour de la connexion.<br>";
+            }
+            case ERREUR -> {
+                pastilleClassement.changer("●  Classement : erreur", Theme.RETARD);
+                detail = Main.echapper(r.dernierMessage()) + "<br>";
+            }
+            default -> pastilleClassement.changer("●  Classement…", Theme.TEXT_DISCRET);
+        }
+        pastilleClassement.setToolTipText("<html>Tes notes sont envoyées au classement après chaque changement.<br>"
+                + detail + "Clique pour <b>tout resynchroniser</b>.</html>");
+    }
+
+    /** « Tout resynchroniser » : renvoie toutes les notes au classement (en arrière-plan), puis affiche le bilan. */
+    static void resynchroniserClassement() {
+        RankingSync r = RankingSync.appli();
+        if (!r.actif()) return;
+        if (pastilleClassement != null) pastilleClassement.changer("●  Classement : envoi…", Theme.ACCENT);
+        r.toutResynchroniser(b -> {
+            majClassement();
+            if (bandeau == null || fenetre == null) return;
+            if (b.ok()) {
+                bandeau.montrer("✓  Classement resynchronisé : " + b.envoyees() + " note(s) envoyée(s)"
+                        + (b.supprimees() > 0 ? ", " + b.supprimees() + " retirée(s)" : "")
+                        + (b.ailleurs() > 0 ? "  ·  " + b.ailleurs() + " note(s) saisie(s) ailleurs comptent aussi" : ""),
+                        Theme.SUCCES, null, null);
+            } else {
+                bandeau.montrer("Classement : " + b.message(), Theme.ATTENTION, null, null);
+            }
+        });
     }
 
     // =====================================================================
@@ -1194,8 +1250,15 @@ public class Note {
                 Bdd.planifier(Database::synchroniser, Note::rafraichir);
             }
         });
+        pastilleClassement = new Theme.Pastille(" ", Theme.TEXT_DISCRET);
+        pastilleClassement.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        pastilleClassement.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) {
+                resynchroniserClassement();
+            }
+        });
         JPanel entete = Theme.entete("Notes et moyennes",
-                Theme.info("BUT1 Informatique · Semestre 1 · calcul officiel par UE"), pastilleSynchro);
+                Theme.info("BUT1 Informatique · Semestre 1 · calcul officiel par UE"), pastilleClassement, pastilleSynchro);
 
         Colonne contenu = new Colonne();
         contenu.setBorder(new EmptyBorder(4, 24, 24, 24));
@@ -1271,6 +1334,7 @@ public class Note {
         rafraichir();
         Theme.auChangement(Note::rafraichir);         // infobulles HTML recolorées
         Bdd.auChangement(Note::majSynchro);
+        RankingSync.appli().auChangement(Note::majClassement);
         return frame;
     }
 }

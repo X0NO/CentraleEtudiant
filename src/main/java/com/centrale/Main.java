@@ -516,6 +516,19 @@ public class Main {
         Bdd.planifier(Note.Database::synchroniser, Main::afficherMoyennes);
     }
 
+    /** Menu Notes > « Classement : tout resynchroniser » : renvoie toutes les notes, en arrière-plan. */
+    static void resynchroniserClassement() {
+        if (Note.fenetre != null && Note.fenetre.isDisplayable()) { // fenêtre des notes ouverte : bilan dans son bandeau
+            Note.resynchroniserClassement();
+            return;
+        }
+        RankingSync.appli().toutResynchroniser(b -> JOptionPane.showMessageDialog(frame,
+                b.ok() ? "Classement resynchronisé : " + b.envoyees() + " note(s) envoyée(s), " + b.supprimees() + " retirée(s)."
+                        + (b.ailleurs() > 0 ? "\n" + b.ailleurs() + " note(s) saisie(s) ailleurs (gestionnaire web) comptent aussi." : "")
+                       : "Classement : " + b.message(),
+                "Classement", b.ok() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE));
+    }
+
     static void afficherMoyennes() {
         Programme.Resultat r;
         try {
@@ -707,6 +720,10 @@ public class Main {
         JMenu notes = menu("Notes", KeyEvent.VK_N);
         item(notes, "Ouvrir les notes", ctrl(KeyEvent.VK_4), Main::ouvrirNotes);
         item(notes, "Actualiser les moyennes", null, Main::chargerMoyennes);
+        if (RankingSync.appli().actif()) {
+            separateur(notes);
+            item(notes, "Classement : tout resynchroniser", null, Main::resynchroniserClassement);
+        }
 
         JMenu raccourcis = menu("Raccourcis", KeyEvent.VK_R);
         item(raccourcis, "Tout actualiser", KeyStroke.getKeyStroke(KeyEvent.VK_F5, 0), Main::toutActualiser);
