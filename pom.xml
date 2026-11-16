@@ -42,6 +42,14 @@
     <version>0.6.8</version>
 </dependency>
 
+<!-- JSON pour l'envoi des notes au classement (RankingSync). Déjà présent dans le projet :
+     c'est la dépendance de biweekly, même version, déclarée ici parce qu'on l'utilise directement. -->
+<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-core</artifactId>
+    <version>2.16.1</version>
+</dependency>
+
 <!-- Lecture des mails Gmail en IMAP : API Jakarta Mail + son implémentation (Angus Mail) -->
 <dependency>
     <groupId>jakarta.mail</groupId>
